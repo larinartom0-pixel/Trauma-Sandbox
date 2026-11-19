@@ -54,6 +54,7 @@ import {
   LootBundle,
   MedItemId,
   NearbyPrompt,
+  OverheadSpeechBubble,
   PhysiologyState,
   WeaponId,
 } from './types';
@@ -64,11 +65,35 @@ import {
   WORLD_BOUND,
 } from './world';
 
-interface Particle {
-  mesh: THREE.Mesh;
+interface PooledSlot {
+  active: boolean;
+  pos: THREE.Vector3;
   vel: THREE.Vector3;
   life: number;
   gravity: number;
+}
+
+interface InstancedParticlePool {
+  mesh: THREE.InstancedMesh;
+  slots: PooledSlot[];
+  cursor: number;
+}
+
+interface PhantomEntity {
+  id: string;
+  rig: GoreDollRig;
+  hitMeshes: THREE.Mesh[];
+  active: boolean;
+  behavior: 'stalker' | 'runner' | 'ambush';
+  pos: THREE.Vector3;
+  vel: THREE.Vector3;
+  yaw: number;
+  life: number;
+  maxLife: number;
+  aimedTime: number;
+  firedFakeShot: boolean;
+  speechText: string | null;
+  speechTimer: number;
 }
 
 interface ThrownGrenade {
@@ -80,6 +105,10 @@ interface ThrownGrenade {
 
 const _vec3 = new THREE.Vector3();
 const _dir = new THREE.Vector3();
+const _right = new THREE.Vector3();
+const _proj = new THREE.Vector3();
+const _dummy = new THREE.Object3D();
+const _zeroMat = new THREE.Matrix4().makeScale(0, 0, 0);
 const _rayOrigin = new THREE.Vector3();
 const _raycaster = new THREE.Raycaster();
 const _skyDay = new THREE.Color(0x6d87a3);
@@ -135,6 +164,7 @@ export class TraumaSandboxEngine {
   private mouseFireHeld = false;
   private lastDragPt: { x: number; y: number } | null = null;
   private pointerLocked = false;
+  private skipNextLockMove = false;
   private sensitivity = 1.0;
   private controlMode: ControlMode = 'auto';
 
@@ -160,11 +190,16 @@ export class TraumaSandboxEngine {
     | null = null;
   private crusherBeam: THREE.Line;
 
-  // FX pools & shared GPU resources (prevents GC/shader stutter on PC)
-  private particles: Particle[] = [];
+  // Instanced FX pools (4 draw calls total, zero runtime Mesh/Vector3 allocations)
+  private bloodPool!: InstancedParticlePool;
+  private sparkPool!: InstancedParticlePool;
+  private expPool!: InstancedParticlePool;
+  private decalMesh!: THREE.InstancedMesh;
+  private decalCursor = 0;
   private grenades: ThrownGrenade[] = [];
-  private decals: THREE.Mesh[] = [];
   private flashLight: THREE.PointLight;
+  private phantomFlashLight: THREE.PointLight;
+  private phantomFlashTimer = 0;
   private pooledLampLight: THREE.PointLight;
   private pooledRoomLight: THREE.PointLight;
   private flashTimer = 0;
@@ -175,8 +210,13 @@ export class TraumaSandboxEngine {
   private bloodMat = new THREE.MeshBasicMaterial({ color: 0x991b1b });
   private sparkMat = new THREE.MeshBasicMaterial({ color: 0xfde047 });
   private expMat1 = new THREE.MeshBasicMaterial({ color: 0xf97316 });
-  private expMat2 = new THREE.MeshBasicMaterial({ color: 0xfacc15 });
   private decalMat!: THREE.MeshBasicMaterial;
+
+  // 3D Phantom hallucination pool (pre-built rigs, zero spawn lag)
+  private phantoms: PhantomEntity[] = [];
+  private phantomHitMeshes: THREE.Mesh[] = [];
+  private cachedAimedBotId: string | null = null;
+  private aimRayTimer = 0;
 
   // Loot & Feed
   private activeLoot: LootBundle | null = null;
@@ -185,7 +225,7 @@ export class TraumaSandboxEngine {
   private prevInfectionPhase: 0 | 1 | 2 = 0;
   private prevConsciousness: PhysiologyState['consciousness'] = 'awake';
   private conscWarnStage: 0 | 1 | 2 = 0;
-  private hallucinationFxTimer = 8;
+  private hallucinationFxTimer = 6;
 
   constructor(
     container: HTMLElement,
@@ -218,10 +258,10 @@ export class TraumaSandboxEngine {
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.08;
     this.renderer.setPixelRatio(
-      this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 1.4),
+      this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 1.25),
     );
     this.renderer.shadowMap.enabled = !this.isSoftwareGl;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer.setSize(container.clientWidth, container.clientHeight);
     container.appendChild(this.renderer.domElement);
 
@@ -248,15 +288,15 @@ export class TraumaSandboxEngine {
     this.sunLight = new THREE.DirectionalLight(0xffedd5, 1.55);
     this.sunLight.position.set(42, 65, 28);
     this.sunLight.castShadow = !this.isSoftwareGl;
-    this.sunLight.shadow.mapSize.set(1024, 1024);
+    this.sunLight.shadow.mapSize.set(768, 768);
     this.sunLight.shadow.camera.near = 2;
-    this.sunLight.shadow.camera.far = 210;
-    const d = 68;
+    this.sunLight.shadow.camera.far = 185;
+    const d = 48;
     this.sunLight.shadow.camera.left = -d;
     this.sunLight.shadow.camera.right = d;
     this.sunLight.shadow.camera.top = d;
     this.sunLight.shadow.camera.bottom = -d;
-    this.sunLight.shadow.bias = -0.0005;
+    this.sunLight.shadow.bias = -0.0006;
     this.sunLight.shadow.normalBias = 0.02;
     this.scene.add(this.sunLight);
     this.scene.add(this.sunLight.target);
@@ -297,6 +337,9 @@ export class TraumaSandboxEngine {
     this.flashLight = new THREE.PointLight(0xffb347, 0, 12, 2);
     this.camera.add(this.flashLight);
     this.flashLight.position.set(0.25, -0.15, -0.7);
+
+    this.phantomFlashLight = new THREE.PointLight(0xffa94d, 0, 14, 2);
+    this.scene.add(this.phantomFlashLight);
 
     const beamGeo = new THREE.BufferGeometry().setFromPoints([
       new THREE.Vector3(),
@@ -362,7 +405,99 @@ export class TraumaSandboxEngine {
       this.world.buildings,
     );
     this.botManager.spawnInitialTownBots();
+    this.initParticleAndPhantomPools();
     this.resetPlayerState();
+  }
+
+  private createParticlePool(
+    geo: THREE.BufferGeometry,
+    mat: THREE.Material,
+    capacity: number,
+  ): InstancedParticlePool {
+    const mesh = new THREE.InstancedMesh(geo, mat, capacity);
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    mesh.frustumCulled = false;
+    const slots: PooledSlot[] = [];
+    for (let i = 0; i < capacity; i++) {
+      mesh.setMatrixAt(i, _zeroMat);
+      slots.push({
+        active: false,
+        pos: new THREE.Vector3(),
+        vel: new THREE.Vector3(),
+        life: 0,
+        gravity: 14,
+      });
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    this.scene.add(mesh);
+    return { mesh, slots, cursor: 0 };
+  }
+
+  private initParticleAndPhantomPools() {
+    this.bloodPool = this.createParticlePool(this.bloodGeo, this.bloodMat, 72);
+    this.sparkPool = this.createParticlePool(this.sparkGeo, this.sparkMat, 36);
+    this.expPool = this.createParticlePool(this.explosionGeo, this.expMat1, 48);
+
+    this.decalMesh = new THREE.InstancedMesh(this.decalGeo, this.decalMat, 48);
+    this.decalMesh.frustumCulled = false;
+    for (let i = 0; i < 48; i++) {
+      this.decalMesh.setMatrixAt(i, _zeroMat);
+    }
+    this.decalMesh.instanceMatrix.needsUpdate = true;
+    this.decalCursor = 0;
+    this.scene.add(this.decalMesh);
+
+    this.phantoms = [];
+    this.phantomHitMeshes = [];
+    const archetypes: Array<'raider' | 'enforcer' | 'survivor'> = [
+      'raider',
+      'enforcer',
+      'survivor',
+    ];
+    const weapons: WeaponId[] = ['rifle_556', 'pistol_9mm', 'shotgun_12ga'];
+    for (let i = 0; i < 3; i++) {
+      const id = `phantom_${i}`;
+      const rig = createGoreDollModel(id, archetypes[i], this.textures.contactShadow);
+      rig.root.visible = false;
+      rig.root.traverse((obj) => {
+        if ((obj as THREE.Mesh).isMesh) {
+          (obj as THREE.Mesh).castShadow = false;
+        }
+      });
+      const wMesh = createWeaponMesh(weapons[i]);
+      wMesh.scale.setScalar(0.86);
+      rig.weaponMount.add(wMesh);
+      this.scene.add(rig.root);
+
+      const hitMeshes = [
+        ...rig.limbMeshes.head,
+        ...rig.limbMeshes.torso,
+        ...rig.limbMeshes.leftArm,
+        ...rig.limbMeshes.rightArm,
+      ];
+      for (const m of hitMeshes) {
+        m.userData.phantomId = id;
+        delete m.userData.botId;
+        this.phantomHitMeshes.push(m);
+      }
+
+      this.phantoms.push({
+        id,
+        rig,
+        hitMeshes,
+        active: false,
+        behavior: 'stalker',
+        pos: new THREE.Vector3(),
+        vel: new THREE.Vector3(),
+        yaw: 0,
+        life: 0,
+        maxLife: 4,
+        aimedTime: 0,
+        firedFakeShot: false,
+        speechText: null,
+        speechTimer: 0,
+      });
+    }
   }
 
   private resetPlayerState() {
@@ -378,7 +513,13 @@ export class TraumaSandboxEngine {
     this.prevInfectionPhase = 0;
     this.prevConsciousness = 'awake';
     this.conscWarnStage = 0;
-    this.hallucinationFxTimer = 8;
+    this.hallucinationFxTimer = 5;
+    this.cachedAimedBotId = null;
+    for (const ph of this.phantoms) {
+      ph.active = false;
+      ph.rig.root.visible = false;
+      ph.speechText = null;
+    }
     this.inventory = createInitialPlayerInventory();
     this.selectWeapon('pistol_9mm');
     this.feed = [];
@@ -395,15 +536,15 @@ export class TraumaSandboxEngine {
         child !== this.camera &&
         child !== this.crusherBeam &&
         child !== this.sunLight.target &&
+        child !== this.phantomFlashLight &&
         !(child as THREE.Light).isLight
       ) {
         toRemove.push(child);
       }
     });
     toRemove.forEach((o) => this.scene.remove(o));
-    this.decals = [];
     this.grenades = [];
-    this.particles = [];
+    this.phantomFlashLight.intensity = 0;
 
     this.initWorldAndPlayer();
     this.phase = 'playing';
@@ -1125,6 +1266,14 @@ export class TraumaSandboxEngine {
     if (this.phase !== 'playing' || this.isKnockedOut()) return;
     const sens = 0.0024 * this.sensitivity * (this.isAiming ? 0.55 : 1);
     if (document.pointerLockElement === this.renderer.domElement) {
+      if (this.skipNextLockMove) {
+        this.skipNextLockMove = false;
+        return;
+      }
+      // Guard against Chromium PointerLock warp spikes when cursor re-centers
+      if (Math.abs(e.movementX) > 220 || Math.abs(e.movementY) > 220) {
+        return;
+      }
       this.playerYaw -= e.movementX * sens;
       this.playerPitch = Math.max(
         -1.45,
@@ -1135,6 +1284,7 @@ export class TraumaSandboxEngine {
       const dx = e.clientX - this.lastDragPt.x;
       const dy = e.clientY - this.lastDragPt.y;
       this.lastDragPt = { x: e.clientX, y: e.clientY };
+      if (Math.abs(dx) > 160 || Math.abs(dy) > 160) return;
       this.playerYaw -= dx * sens * 1.4;
       this.playerPitch = Math.max(
         -1.45,
@@ -1188,8 +1338,13 @@ export class TraumaSandboxEngine {
   };
 
   private onPointerLockChange = () => {
+    const wasLocked = this.pointerLocked;
     this.pointerLocked =
       document.pointerLockElement === this.renderer.domElement;
+    if (this.pointerLocked && !wasLocked) {
+      this.skipNextLockMove = true;
+      this.lastDragPt = null;
+    }
     this.pushSnapshot(true);
   };
 
@@ -1399,6 +1554,7 @@ export class TraumaSandboxEngine {
 
     const targets = [
       ...this.botManager.getAllRaycastMeshes(),
+      ...(this.phantoms.some((ph) => ph.active) ? this.phantomHitMeshes : []),
       ...this.world.propHitMeshes,
       ...this.world.raycastWalls,
     ];
@@ -1417,7 +1573,13 @@ export class TraumaSandboxEngine {
       let powerRemaining = 1.0;
 
       for (const hit of hits) {
-        if (hit.object.userData.botId) {
+        if (hit.object.userData.phantomId) {
+          const ph = this.phantoms.find((x) => x.id === hit.object.userData.phantomId);
+          if (ph && ph.active) {
+            this.dismissPhantom(ph, true);
+            break;
+          }
+        } else if (hit.object.userData.botId) {
           const { severed } = this.botManager.damageBotLimb(
             hit.object.userData.botId,
             hit.object.userData.limbId,
@@ -1463,29 +1625,84 @@ export class TraumaSandboxEngine {
     }
   }
 
+  private spawnPooledParticle(
+    pool: InstancedParticlePool,
+    x: number,
+    y: number,
+    z: number,
+    vx: number,
+    vy: number,
+    vz: number,
+    life: number,
+    gravity: number,
+  ) {
+    const slot = pool.slots[pool.cursor];
+    pool.cursor = (pool.cursor + 1) % pool.slots.length;
+    slot.active = true;
+    slot.pos.set(x, y, z);
+    slot.vel.set(vx, vy, vz);
+    slot.life = life;
+    slot.gravity = gravity;
+    _dummy.position.set(x, y, z);
+    _dummy.rotation.set(0, 0, 0);
+    _dummy.scale.set(1, 1, 1);
+    _dummy.updateMatrix();
+    pool.mesh.setMatrixAt(
+      (pool.cursor + pool.slots.length - 1) % pool.slots.length,
+      _dummy.matrix,
+    );
+    pool.mesh.instanceMatrix.needsUpdate = true;
+  }
+
+  private stepParticlePool(pool: InstancedParticlePool, dt: number) {
+    let anyUpdated = false;
+    for (let i = 0; i < pool.slots.length; i++) {
+      const pt = pool.slots[i];
+      if (!pt.active) continue;
+      anyUpdated = true;
+      pt.life -= dt;
+      if (pt.life <= 0) {
+        pt.active = false;
+        pool.mesh.setMatrixAt(i, _zeroMat);
+        continue;
+      }
+      pt.vel.y -= pt.gravity * dt;
+      pt.pos.x += pt.vel.x * dt;
+      pt.pos.y += pt.vel.y * dt;
+      pt.pos.z += pt.vel.z * dt;
+      if (pt.pos.y < 0.04) {
+        pt.pos.y = 0.04;
+        pt.vel.set(0, 0, 0);
+      }
+      _dummy.position.copy(pt.pos);
+      _dummy.rotation.set(0, 0, 0);
+      _dummy.scale.set(1, 1, 1);
+      _dummy.updateMatrix();
+      pool.mesh.setMatrixAt(i, _dummy.matrix);
+    }
+    if (anyUpdated) {
+      pool.mesh.instanceMatrix.needsUpdate = true;
+    }
+  }
+
   private explodeAt(center: THREE.Vector3, radius: number, maxDmg: number) {
     soundEngine.playExplosion();
     this.botManager.alertBotsToGunshot(center, 68);
     this.shakeIntensity = Math.min(0.32, this.shakeIntensity + 0.22);
     this.hitstopTimer = 0.06;
 
-    for (let i = 0; i < 18; i++) {
-      const m = new THREE.Mesh(
-        this.explosionGeo,
-        i % 2 === 0 ? this.expMat1 : this.expMat2,
+    for (let i = 0; i < 16; i++) {
+      this.spawnPooledParticle(
+        this.expPool,
+        center.x,
+        center.y,
+        center.z,
+        (Math.random() - 0.5) * 14,
+        3 + Math.random() * 10,
+        (Math.random() - 0.5) * 14,
+        0.45 + Math.random() * 0.3,
+        16,
       );
-      m.position.copy(center);
-      this.scene.add(m);
-      this.particles.push({
-        mesh: m,
-        vel: new THREE.Vector3(
-          (Math.random() - 0.5) * 14,
-          3 + Math.random() * 10,
-          (Math.random() - 0.5) * 14,
-        ),
-        life: 0.45 + Math.random() * 0.35,
-        gravity: 16,
-      });
     }
 
     for (const bot of this.botManager.bots) {
@@ -1536,50 +1753,44 @@ export class TraumaSandboxEngine {
   }
 
   private spawnBloodBurst(pos: THREE.Vector3, count: number) {
-    const cap = Math.min(count, this.isSoftwareGl ? 6 : Math.min(14, count));
+    const cap = Math.min(count, this.isSoftwareGl ? 5 : Math.min(10, count));
     for (let i = 0; i < cap; i++) {
-      const m = new THREE.Mesh(this.bloodGeo, this.bloodMat);
-      m.position.copy(pos);
-      this.scene.add(m);
-      this.particles.push({
-        mesh: m,
-        vel: new THREE.Vector3(
-          (Math.random() - 0.5) * 5.5,
-          1.2 + Math.random() * 3.8,
-          (Math.random() - 0.5) * 5.5,
-        ),
-        life: 0.4 + Math.random() * 0.3,
-        gravity: 14,
-      });
+      this.spawnPooledParticle(
+        this.bloodPool,
+        pos.x,
+        pos.y,
+        pos.z,
+        (Math.random() - 0.5) * 5.5,
+        1.2 + Math.random() * 3.8,
+        (Math.random() - 0.5) * 5.5,
+        0.38 + Math.random() * 0.28,
+        14,
+      );
     }
 
-    if (this.decals.length < 48) {
-      const decal = new THREE.Mesh(this.decalGeo, this.decalMat);
-      const s = 1.1 + Math.random() * 0.7;
-      decal.scale.set(s, s, 1);
-      decal.rotation.x = -Math.PI / 2;
-      decal.rotation.z = Math.random() * Math.PI * 2;
-      decal.position.set(pos.x, 0.035, pos.z);
-      this.scene.add(decal);
-      this.decals.push(decal);
-    }
+    const s = 1.05 + Math.random() * 0.65;
+    _dummy.position.set(pos.x, 0.035, pos.z);
+    _dummy.rotation.set(-Math.PI / 2, 0, Math.random() * Math.PI * 2);
+    _dummy.scale.set(s, s, 1);
+    _dummy.updateMatrix();
+    this.decalMesh.setMatrixAt(this.decalCursor, _dummy.matrix);
+    this.decalMesh.instanceMatrix.needsUpdate = true;
+    this.decalCursor = (this.decalCursor + 1) % 48;
   }
 
   private spawnSparkBurst(pos: THREE.Vector3) {
     for (let i = 0; i < 4; i++) {
-      const m = new THREE.Mesh(this.sparkGeo, this.sparkMat);
-      m.position.copy(pos);
-      this.scene.add(m);
-      this.particles.push({
-        mesh: m,
-        vel: new THREE.Vector3(
-          (Math.random() - 0.5) * 4,
-          Math.random() * 3,
-          (Math.random() - 0.5) * 4,
-        ),
-        life: 0.22,
-        gravity: 10,
-      });
+      this.spawnPooledParticle(
+        this.sparkPool,
+        pos.x,
+        pos.y,
+        pos.z,
+        (Math.random() - 0.5) * 4,
+        Math.random() * 3,
+        (Math.random() - 0.5) * 4,
+        0.2,
+        10,
+      );
     }
   }
 
@@ -1799,33 +2010,8 @@ export class TraumaSandboxEngine {
       }
     }
 
-    // Brain damage auditory/mental hallucination events
-    if (
-      this.phys.hallucinationLevel > 26 &&
-      !this.isKnockedOut() &&
-      this.phys.consciousness !== 'dead'
-    ) {
-      this.hallucinationFxTimer -= dt;
-      if (this.hallucinationFxTimer <= 0) {
-        this.hallucinationFxTimer = Math.max(
-          7,
-          17 - (this.phys.hallucinationLevel / 100) * 9 + Math.random() * 5,
-        );
-        const phantomMsgs = [
-          '…Хтось стоїть прямо за спиною… (Галюцинація)',
-          '…Приглушений постріл поруч… чи це в голові?',
-          '…Тіні рухаються біля дверей… (Ураження мозку)',
-          '…Кроки в коридорі замовкли…',
-        ];
-        if (Math.random() < 0.55) {
-          soundEngine.playGunshot('pistol_9mm');
-        }
-        this.pushFeed(
-          phantomMsgs[Math.floor(Math.random() * phantomMsgs.length)],
-          'warn',
-        );
-      }
-    }
+    // Believable 3D Visual & Spatial Audio Hallucinations (no spoiler text feed)
+    this.stepPhantoms(dt, elapsed);
 
     if (this.phys.consciousness === 'dead') {
       this.phase = 'dead';
@@ -2043,8 +2229,8 @@ export class TraumaSandboxEngine {
         headDroop +
         brainDmgFrac * Math.cos(elapsed * 2.7) * 0.028;
       const swimYaw =
-        coordDebuffFrac * Math.sin(elapsed * 1.4) * 0.11 +
-        brainDmgFrac * Math.sin(elapsed * 1.8) * 0.035;
+        coordDebuffFrac * Math.sin(elapsed * 1.4) * 0.048 +
+        brainDmgFrac * Math.sin(elapsed * 1.8) * 0.022;
       const bob =
         len > 0.1 && this.isGrounded && !knockedOut
           ? Math.sin(elapsed * (leftBroken || rightBroken ? 6 : 10)) * 0.035
@@ -2254,29 +2440,30 @@ export class TraumaSandboxEngine {
       }
     }
 
-    for (let i = this.particles.length - 1; i >= 0; i--) {
-      const pt = this.particles[i];
-      pt.life -= dt;
-      pt.vel.y -= pt.gravity * dt;
-      pt.mesh.position.addScaledVector(pt.vel, dt);
-      if (pt.mesh.position.y < 0.04) {
-        pt.mesh.position.y = 0.04;
-        pt.vel.set(0, 0, 0);
-      }
-      if (pt.life <= 0) {
-        this.scene.remove(pt.mesh);
-        this.particles.splice(i, 1);
+    this.stepParticlePool(this.bloodPool, dt);
+    this.stepParticlePool(this.sparkPool, dt);
+    this.stepParticlePool(this.expPool, dt);
+
+    if (this.phantomFlashTimer > 0) {
+      this.phantomFlashTimer -= dt;
+      if (this.phantomFlashTimer <= 0) {
+        this.phantomFlashLight.intensity = 0;
       }
     }
 
-    let aimedBotId: string | null = null;
-    if (this.activeWeapon !== 'hands' && !knockedOut) {
-      _dir.set(0, 0, -1).applyEuler(this.camera.rotation);
-      _raycaster.set(this.camera.position, _dir);
-      _raycaster.far = 16;
-      const hits = _raycaster.intersectObjects(this.botManager.getAllRaycastMeshes(), false);
-      if (hits.length > 0 && hits[0].object.userData.botId) {
-        aimedBotId = hits[0].object.userData.botId;
+    // Throttle crosshair aimed-bot raycast to ~12 Hz instead of every frame
+    this.aimRayTimer -= dt;
+    if (this.aimRayTimer <= 0) {
+      this.aimRayTimer = 0.085;
+      this.cachedAimedBotId = null;
+      if (this.activeWeapon !== 'hands' && !knockedOut) {
+        _dir.set(0, 0, -1).applyEuler(this.camera.rotation);
+        _raycaster.set(this.camera.position, _dir);
+        _raycaster.far = 16;
+        const hits = _raycaster.intersectObjects(this.botManager.getAllRaycastMeshes(), false);
+        if (hits.length > 0 && hits[0].object.userData.botId) {
+          this.cachedAimedBotId = hits[0].object.userData.botId;
+        }
       }
     }
 
@@ -2287,7 +2474,7 @@ export class TraumaSandboxEngine {
     this.botManager.update(
       dt,
       this.playerPos,
-      aimedBotId,
+      this.cachedAimedBotId,
       this.activeWeapon !== 'hands',
       this.isCrouching,
       playerMovingFast,
@@ -2295,9 +2482,193 @@ export class TraumaSandboxEngine {
       this.activeLoot?.id ?? null,
     );
 
-    if (elapsed - this.lastSnapshotTime >= 0.095) {
+    if (elapsed - this.lastSnapshotTime >= 0.115) {
       this.lastSnapshotTime = elapsed;
       this.pushSnapshot();
+    }
+  }
+
+  private computeStereoPan(worldPos: THREE.Vector3): number {
+    _right.set(1, 0, 0).applyEuler(this.camera.rotation).setY(0).normalize();
+    _vec3.subVectors(worldPos, this.playerPos).setY(0);
+    const len = _vec3.length();
+    if (len < 0.01) return 0;
+    _vec3.divideScalar(len);
+    return Math.max(-1, Math.min(1, _right.dot(_vec3)));
+  }
+
+  private dismissPhantom(ph: PhantomEntity, burstStatic: boolean) {
+    ph.active = false;
+    ph.rig.root.visible = false;
+    ph.speechText = null;
+    if (burstStatic) {
+      this.spawnSparkBurst(
+        _vec3.set(ph.pos.x, ph.pos.y + 1.15, ph.pos.z),
+      );
+      soundEngine.playPhantomWhisper(this.computeStereoPan(ph.pos));
+    }
+  }
+
+  private spawnPhantomIllusion() {
+    const slot = this.phantoms.find((p) => !p.active);
+    if (!slot) return;
+
+    const roll = Math.random();
+    const behavior: PhantomEntity['behavior'] =
+      roll < 0.42 ? 'stalker' : roll < 0.76 ? 'runner' : 'ambush';
+
+    // Pick a believable spot in peripheral/ahead/behind vision (10-24m away)
+    const angleOffset =
+      behavior === 'runner'
+        ? (Math.random() < 0.5 ? 1 : -1) * (0.28 + Math.random() * 0.45)
+        : (Math.random() < 0.5 ? 1 : -1) * (0.75 + Math.random() * 1.85);
+    const dist = behavior === 'runner' ? 14 + Math.random() * 10 : 10 + Math.random() * 12;
+    const spawnAngle = this.playerYaw + Math.PI + angleOffset;
+    const rawX = this.playerPos.x + Math.sin(spawnAngle) * dist;
+    const rawZ = this.playerPos.z + Math.cos(spawnAngle) * dist;
+    const walkable = this.botManager.navMesh.findNearestWalkable(rawX, rawZ, 6);
+    if (!walkable) return;
+    if (walkable.distanceTo(this.playerPos) < 7.5) return;
+
+    slot.active = true;
+    slot.behavior = behavior;
+    slot.pos.copy(walkable);
+    slot.aimedTime = 0;
+    slot.firedFakeShot = false;
+    slot.maxLife = behavior === 'runner' ? 2.4 + Math.random() * 1.2 : 4.2 + Math.random() * 2.5;
+    slot.life = slot.maxLife;
+    slot.speechText = null;
+    slot.speechTimer = 0;
+
+    if (behavior === 'runner') {
+      const crossYaw = this.playerYaw + (Math.random() < 0.5 ? Math.PI / 2 : -Math.PI / 2);
+      slot.yaw = crossYaw;
+      slot.vel.set(Math.sin(crossYaw) * 4.4, 0, Math.cos(crossYaw) * 4.4);
+      soundEngine.playSpatialFootsteps(
+        this.computeStereoPan(slot.pos),
+        walkable.distanceTo(this.playerPos),
+        4,
+      );
+    } else {
+      slot.yaw = Math.atan2(
+        this.playerPos.x - slot.pos.x,
+        this.playerPos.z - slot.pos.z,
+      );
+      slot.vel.set(0, 0, 0);
+      const pan = this.computeStereoPan(slot.pos);
+      const d = walkable.distanceTo(this.playerPos);
+      if (Math.random() < 0.5) {
+        soundEngine.playSpatialReloadClick(pan, d);
+      } else {
+        soundEngine.playSpatialFootsteps(pan, d, 2);
+      }
+      if (this.phys.hallucinationLevel > 48 && Math.random() < 0.45) {
+        const lines = ['Я тут…', 'Не обертайся…', 'Бачу тебе.', 'Ти один?'];
+        slot.speechText = lines[Math.floor(Math.random() * lines.length)];
+        slot.speechTimer = 2.6;
+      }
+    }
+
+    slot.rig.root.position.copy(slot.pos);
+    slot.rig.root.rotation.set(0, slot.yaw, 0);
+    slot.rig.root.visible = true;
+  }
+
+  private stepPhantoms(dt: number, elapsed: number) {
+    const hLevel = this.phys.hallucinationLevel;
+    const activeAllowed =
+      hLevel > 20 && !this.isKnockedOut() && this.phys.consciousness !== 'dead';
+
+    if (!activeAllowed) {
+      for (const ph of this.phantoms) {
+        if (ph.active) this.dismissPhantom(ph, false);
+      }
+      return;
+    }
+
+    this.hallucinationFxTimer -= dt;
+    if (this.hallucinationFxTimer <= 0) {
+      this.hallucinationFxTimer = Math.max(
+        3.2,
+        13.5 - (hLevel / 100) * 9.0 + Math.random() * 3.5,
+      );
+
+      if (Math.random() < 0.68) {
+        this.spawnPhantomIllusion();
+      } else {
+        // Pure spatialized audio illusion behind/beside player
+        const sideAngle = this.playerYaw + Math.PI + (Math.random() < 0.5 ? 1.85 : -1.85);
+        const audioPos = _vec3.set(
+          this.playerPos.x + Math.sin(sideAngle) * 7.5,
+          1.4,
+          this.playerPos.z + Math.cos(sideAngle) * 7.5,
+        );
+        const pan = this.computeStereoPan(audioPos);
+        const r = Math.random();
+        if (r < 0.36) soundEngine.playSpatialFootsteps(pan, 6.5, 3);
+        else if (r < 0.68) soundEngine.playSpatialReloadClick(pan, 7.0);
+        else if (r < 0.86) soundEngine.playSpatialGunshot('pistol_9mm', pan, 22);
+        else soundEngine.playPhantomWhisper(pan);
+      }
+    }
+
+    _dir.set(0, 0, -1).applyEuler(this.camera.rotation).normalize();
+    for (const ph of this.phantoms) {
+      if (!ph.active) continue;
+      ph.life -= dt;
+      if (ph.speechTimer > 0) {
+        ph.speechTimer -= dt;
+        if (ph.speechTimer <= 0) ph.speechText = null;
+      }
+
+      const dist = ph.pos.distanceTo(this.playerPos);
+      if (ph.life <= 0 || dist < 4.2) {
+        this.dismissPhantom(ph, dist < 4.2);
+        continue;
+      }
+
+      // Check if player looks directly at the phantom -> fades out believably after brief stare
+      _vec3.subVectors(ph.pos, this.playerPos).setY(0).normalize();
+      const lookDot = _dir.x * _vec3.x + _dir.z * _vec3.z;
+      if (lookDot > 0.94 && dist < 24) {
+        ph.aimedTime += dt;
+        if (ph.aimedTime > 0.42) {
+          this.dismissPhantom(ph, false);
+          continue;
+        }
+      } else {
+        ph.aimedTime = Math.max(0, ph.aimedTime - dt * 0.5);
+      }
+
+      if (ph.behavior === 'runner') {
+        ph.pos.addScaledVector(ph.vel, dt);
+        const stride = Math.sin(elapsed * 11) * 0.55;
+        ph.rig.limbs.leftLeg.rotation.x = stride;
+        ph.rig.limbs.rightLeg.rotation.x = -stride;
+        ph.rig.limbs.leftArm.rotation.x = -stride * 0.6;
+        ph.rig.limbs.rightArm.rotation.x = stride * 0.6;
+      } else {
+        ph.yaw = Math.atan2(
+          this.playerPos.x - ph.pos.x,
+          this.playerPos.z - ph.pos.z,
+        );
+        ph.rig.limbs.leftLeg.rotation.x = 0;
+        ph.rig.limbs.rightLeg.rotation.x = 0;
+        ph.rig.limbs.leftArm.rotation.x = -0.35;
+        ph.rig.limbs.rightArm.rotation.x = -1.35;
+
+        if (ph.behavior === 'ambush' && !ph.firedFakeShot && ph.life < ph.maxLife * 0.55) {
+          ph.firedFakeShot = true;
+          this.phantomFlashLight.position.set(ph.pos.x, 1.4, ph.pos.z);
+          this.phantomFlashLight.intensity = 6.5;
+          this.phantomFlashTimer = 0.08;
+          this.spawnSparkBurst(_vec3.set(ph.pos.x, 1.38, ph.pos.z));
+          soundEngine.playSpatialGunshot('rifle_556', this.computeStereoPan(ph.pos), dist);
+        }
+      }
+
+      ph.rig.root.position.copy(ph.pos);
+      ph.rig.root.rotation.set(0, ph.yaw, 0);
     }
   }
 
@@ -2362,12 +2733,87 @@ export class TraumaSandboxEngine {
     return bestPrompt;
   }
 
+  private buildOverheadSpeechBubbles(): OverheadSpeechBubble[] {
+    if (this.phase !== 'playing' || this.isKnockedOut()) return [];
+    const bubbles: OverheadSpeechBubble[] = [];
+
+    const tryProject = (
+      id: string,
+      pos: THREE.Vector3,
+      headY: number,
+      text: string,
+      tone: OverheadSpeechBubble['tone'],
+    ) => {
+      const dist = pos.distanceTo(this.playerPos);
+      if (dist > 34) return;
+      _proj.set(pos.x, pos.y + headY, pos.z).project(this.camera);
+      if (_proj.z >= 1 || Math.abs(_proj.x) > 1.02 || Math.abs(_proj.y) > 1.02) return;
+      if (!this.botManager.hasLineOfSight(this.playerPos, pos, 1.55, 1.55)) return;
+      bubbles.push({
+        id,
+        text,
+        tone,
+        xPct: (_proj.x * 0.5 + 0.5) * 100,
+        yPct: (-_proj.y * 0.5 + 0.5) * 100,
+        dist,
+      });
+    };
+
+    for (const bot of this.botManager.bots) {
+      if (bot.speechText && bot.speechTimer > 0 && bot.aiState !== 'dead') {
+        const headY = bot.crouchFactor > 0.5 ? 1.52 : 2.02;
+        tryProject(bot.id, bot.pos, headY, bot.speechText, bot.speechTone);
+      }
+    }
+
+    for (const ph of this.phantoms) {
+      if (ph.active && ph.speechText && ph.speechTimer > 0) {
+        tryProject(ph.id, ph.pos, 2.02, ph.speechText, 'warn');
+      }
+    }
+
+    if (bubbles.length > 5) {
+      bubbles.sort((a, b) => a.dist - b.dist);
+      bubbles.length = 5;
+    }
+    return bubbles;
+  }
+
+  private clonePhysSnapshot(): PhysiologyState {
+    return {
+      ...this.phys,
+      limbs: {
+        head: { ...this.phys.limbs.head },
+        torso: { ...this.phys.limbs.torso },
+        leftArm: { ...this.phys.limbs.leftArm },
+        rightArm: { ...this.phys.limbs.rightArm },
+        leftLeg: { ...this.phys.limbs.leftLeg },
+        rightLeg: { ...this.phys.limbs.rightLeg },
+      },
+      organs: { ...this.phys.organs },
+    };
+  }
+
+  private cloneInventorySnapshot(): InventoryState {
+    return {
+      ...this.inventory,
+      ownedWeapons: [...this.inventory.ownedWeapons],
+      magAmmo: { ...this.inventory.magAmmo },
+      reserveAmmo: { ...this.inventory.reserveAmmo },
+      meds: { ...this.inventory.meds },
+      backpack: {
+        ...this.inventory.backpack,
+        items: this.inventory.backpack.items.map((it) => ({ ...it })),
+      },
+    };
+  }
+
   private pushSnapshot(force = false) {
     if (force) this.lastSnapshotTime = this.clock.elapsedTime;
     this.onSnapshot({
       phase: this.phase,
-      physiology: structuredClone(this.phys),
-      inventory: structuredClone(this.inventory),
+      physiology: this.clonePhysSnapshot(),
+      inventory: this.cloneInventorySnapshot(),
       activeWeapon: this.activeWeapon,
       cameraMode: this.cameraMode,
       flashlightOn: this.flashlightOn,
@@ -2378,8 +2824,20 @@ export class TraumaSandboxEngine {
       crusherHolding: Boolean(this.grabbedTarget),
       pointerLocked: this.pointerLocked,
       nearbyPrompt: this.findNearbyInteractable(),
-      activeLoot: this.activeLoot ? structuredClone(this.activeLoot) : null,
+      activeLoot: this.activeLoot
+        ? {
+            ...this.activeLoot,
+            weapons: [...this.activeLoot.weapons],
+            ammo: { ...this.activeLoot.ammo },
+            meds: { ...this.activeLoot.meds },
+            grid: {
+              ...this.activeLoot.grid,
+              items: this.activeLoot.grid.items.map((it) => ({ ...it })),
+            },
+          }
+        : null,
       activeGesture: this.activeGesture,
+      speechBubbles: this.buildOverheadSpeechBubbles(),
       feed: this.feed,
       playerPos: { x: this.playerPos.x, z: this.playerPos.z, yaw: this.playerYaw },
     });

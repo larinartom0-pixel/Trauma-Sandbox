@@ -563,3 +563,54 @@ export async function toggleFullscreenCompat(): Promise<{
   const nowActive = Boolean(getFullscreenElement());
   return { active: nowActive, blocked: !nowActive };
 }
+
+const GLITCH_SWAP: Record<string, string> = {
+  а: '@',
+  А: '4',
+  е: '3',
+  Е: '€',
+  і: '1',
+  І: '!',
+  о: '0',
+  О: '0',
+  с: 'c',
+  С: '(',
+  р: 'p',
+  Р: 'P',
+  к: 'k',
+  т: '†',
+  н: 'H',
+  в: 'B',
+  З: '3',
+  з: '3',
+  a: '@',
+  e: '3',
+  i: '1',
+  o: '0',
+  s: '$',
+};
+const GLITCH_NOISE = ['▓', '▒', '░', '█', '?', '#', '!', '%'];
+
+export function corruptText(text: string, intensity: number, seed: number): string {
+  if (intensity <= 0.14 || !text) return text;
+  const prob = Math.min(0.68, (intensity - 0.12) * 0.72);
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === ' ' || ch === '\n') {
+      out += ch;
+      continue;
+    }
+    const h = Math.abs(Math.sin((i + 1) * 19.37 + seed * 7.13) * 43758.5453) % 1;
+    if (h < prob) {
+      if (h < prob * 0.28 && intensity > 0.45) {
+        out += GLITCH_NOISE[(i + Math.floor(seed * 3)) % GLITCH_NOISE.length];
+      } else {
+        out += GLITCH_SWAP[ch] ?? (intensity > 0.62 ? '?' : ch);
+      }
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}

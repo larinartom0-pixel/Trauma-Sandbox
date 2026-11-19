@@ -289,6 +289,15 @@ export interface NearbyPrompt {
   aiState?: BotAIState;
 }
 
+export interface OverheadSpeechBubble {
+  id: string;
+  text: string;
+  tone: 'neutral' | 'warn' | 'danger' | 'friendly';
+  xPct: number;
+  yPct: number;
+  dist: number;
+}
+
 export interface GameSnapshot {
   phase: GamePhase;
   physiology: PhysiologyState;
@@ -305,6 +314,7 @@ export interface GameSnapshot {
   nearbyPrompt: NearbyPrompt | null;
   activeLoot: LootBundle | null;
   activeGesture: GestureId | null;
+  speechBubbles: OverheadSpeechBubble[];
   feed: FeedMessage[];
   playerPos: { x: number; z: number; yaw: number };
 }

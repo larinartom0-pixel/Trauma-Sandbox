@@ -21,6 +21,7 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import {
+  corruptText,
   DEFAULT_HUD_LAYOUT,
   detectTouchMode,
   GESTURE_DEFS,
@@ -139,6 +140,7 @@ export const GameHud: React.FC<GameHudProps> = ({
   );
   const [fsBlockedMsg, setFsBlockedMsg] = useState(false);
   const [fxPhase, setFxPhase] = useState(0);
+  const [glitchSeed, setGlitchSeed] = useState(1);
 
   useEffect(() => {
     const onFs = () => {
@@ -285,45 +287,42 @@ export const GameHud: React.FC<GameHudProps> = ({
     10,
     Math.round(52 - vignetteStrength * 34 - visionImpairFrac * 18),
   );
-  const visionBlurPx =
-    visionImpairFrac > 0.04
-      ? Number(
-          (
-            visionImpairFrac * 6.8 +
-            Math.sin(fxPhase * 2.3) * visionImpairFrac * 1.8
-          ).toFixed(1),
-        )
-      : 0;
-  const eyelidBlinkWave = 0.5 + 0.5 * Math.sin(fxPhase * 1.55);
   const eyelidHeightPct =
     cloudFrac > 0.24
-      ? Math.min(44, (cloudFrac - 0.24) * 34 + eyelidBlinkWave * cloudFrac * 18)
+      ? Math.min(42, (cloudFrac - 0.24) * 44)
       : 0;
   const dimVeilOpacity =
     cloudFrac > 0.22
-      ? Math.min(0.68, (cloudFrac - 0.22) * 0.52 + eyelidBlinkWave * cloudFrac * 0.22)
+      ? Math.min(0.66, (cloudFrac - 0.22) * 0.68)
       : 0;
 
+  // Tick sawtooth wake-up timer ONLY while unconscious / in cardiac arrest
   useEffect(() => {
     if (
       phys.consciousness !== 'unconscious' &&
-      phys.consciousness !== 'cardiacArrest' &&
-      phys.consciousnessPct >= 78 &&
-      phys.postWakeDebuffTimer <= 0 &&
-      phys.hallucinationLevel <= 18
+      phys.consciousness !== 'cardiacArrest'
     ) {
       return;
     }
     const id = window.setInterval(() => {
-      setFxPhase((p) => (p + 0.12) % (Math.PI * 20));
-    }, 80);
+      setFxPhase((p) => (p + 0.22) % (Math.PI * 20));
+    }, 140);
     return () => window.clearInterval(id);
-  }, [
-    phys.consciousness,
-    phys.consciousnessPct,
-    phys.postWakeDebuffTimer,
-    phys.hallucinationLevel,
-  ]);
+  }, [phys.consciousness]);
+
+  // Lightweight text-corruption tick ONLY when actively hallucinating while awake
+  useEffect(() => {
+    if (isKnockedOut || phys.hallucinationLevel <= 18) return;
+    const id = window.setInterval(() => {
+      setGlitchSeed((s) => (s + 1) % 997);
+    }, 280);
+    return () => window.clearInterval(id);
+  }, [isKnockedOut, phys.hallucinationLevel]);
+
+  const txt = (str: string, boost = 0) =>
+    hallucFrac > 0.16
+      ? corruptText(str, Math.min(1, hallucFrac + boost), glitchSeed)
+      : str;
 
   const wakeProgress =
     phys.unconsciousMaxSec > 0
@@ -375,29 +374,73 @@ export const GameHud: React.FC<GameHudProps> = ({
 
   return (
     <div className="fixed inset-0 z-20 pointer-events-none overflow-hidden">
-      {/* Pre-Blackout Clouding & Post-Wake Heavy Blur + Swimming Double-Vision Effect */}
-      {visionBlurPx > 0.25 && !isKnockedOut && (
+      {/* Overhead World-Space Bot & Phantom Speech Bubbles */}
+      {!editMode &&
+        snapshot.phase === 'playing' &&
+        !isKnockedOut &&
+        snapshot.speechBubbles.length > 0 && (
+          <div className="absolute inset-0 pointer-events-none z-10 overflow-hidden">
+            {snapshot.speechBubbles.map((b) => {
+              const scale = Math.max(0.68, Math.min(1.04, 1.12 - b.dist * 0.015));
+              const bubbleCls =
+                b.tone === 'danger'
+                  ? 'bg-red-950/92 border-red-400/75 text-red-100'
+                  : b.tone === 'warn'
+                    ? 'bg-amber-950/92 border-amber-400/75 text-amber-100'
+                    : b.tone === 'friendly'
+                      ? 'bg-emerald-950/92 border-emerald-400/75 text-emerald-100'
+                      : 'bg-[#0b0e14]/92 border-white/25 text-slate-100';
+              const tailCls =
+                b.tone === 'danger'
+                  ? 'bg-red-950/92 border-red-400/75'
+                  : b.tone === 'warn'
+                    ? 'bg-amber-950/92 border-amber-400/75'
+                    : b.tone === 'friendly'
+                      ? 'bg-emerald-950/92 border-emerald-400/75'
+                      : 'bg-[#0b0e14]/92 border-white/25';
+              return (
+                <div
+                  key={b.id}
+                  className="absolute flex flex-col items-center pointer-events-none"
+                  style={{
+                    left: `${b.xPct.toFixed(2)}%`,
+                    top: `${b.yPct.toFixed(2)}%`,
+                    transform: `translate(-50%, -100%) scale(${scale.toFixed(2)})`,
+                    transformOrigin: 'bottom center',
+                  }}
+                >
+                  <div
+                    className={`px-2.5 py-1 rounded-md border text-[11px] font-semibold shadow-lg whitespace-nowrap max-w-[230px] truncate ${bubbleCls}`}
+                  >
+                    {txt(b.text)}
+                  </div>
+                  <div className={`w-2 h-2 rotate-45 -mt-1 border-r border-b ${tailCls}`} />
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+      {/* Lightweight GPU Pre-Blackout Clouding & Post-Wake Tunnel Haze (no backdrop-filter blur) */}
+      {visionImpairFrac > 0.05 && !isKnockedOut && (
         <div
-          className="absolute inset-0 pointer-events-none transition-all duration-100"
+          className="absolute inset-0 pointer-events-none transition-opacity duration-200"
           style={{
-            backdropFilter: `blur(${visionBlurPx}px) saturate(${Math.max(0.28, 1 - cloudFrac * 0.65).toFixed(2)})`,
-            WebkitBackdropFilter: `blur(${visionBlurPx}px) saturate(${Math.max(0.28, 1 - cloudFrac * 0.65).toFixed(2)})`,
-            transform: `scale(${1 + visionImpairFrac * 0.04}) translate(${(Math.sin(fxPhase * 1.9) * visionImpairFrac * 9).toFixed(1)}px, ${(Math.cos(fxPhase * 1.5) * visionImpairFrac * 7).toFixed(1)}px)`,
-            background: `radial-gradient(circle, rgba(255,255,255,${(visionImpairFrac * 0.06).toFixed(2)}) ${tunnelRadiusPct}%, rgba(6, 7, 12, ${(0.42 + visionImpairFrac * 0.44).toFixed(2)}) ${Math.min(95, tunnelRadiusPct + 24)}%)`,
+            background: `radial-gradient(circle, rgba(220,226,238,${(visionImpairFrac * 0.14).toFixed(2)}) ${tunnelRadiusPct}%, rgba(6, 7, 12, ${(0.45 + visionImpairFrac * 0.45).toFixed(2)}) ${Math.min(95, tunnelRadiusPct + 24)}%)`,
           }}
         />
       )}
 
-      {/* Pre-Blackout Dimming Veil + Heavy Drooping/Blinking Eyelids */}
+      {/* Pre-Blackout Dimming Veil + Drooping Eyelids */}
       {dimVeilOpacity > 0.04 && !isKnockedOut && (
         <div
-          className="absolute inset-0 pointer-events-none"
+          className="absolute inset-0 pointer-events-none transition-opacity duration-200"
           style={{ backgroundColor: `rgba(3, 4, 8, ${dimVeilOpacity.toFixed(2)})` }}
         >
           {eyelidHeightPct > 1 && (
             <>
               <div
-                className="absolute inset-x-0 top-0 pointer-events-none"
+                className="absolute inset-x-0 top-0 pointer-events-none transition-all duration-300"
                 style={{
                   height: `${eyelidHeightPct.toFixed(1)}%`,
                   background:
@@ -405,7 +448,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                 }}
               />
               <div
-                className="absolute inset-x-0 bottom-0 pointer-events-none"
+                className="absolute inset-x-0 bottom-0 pointer-events-none transition-all duration-300"
                 style={{
                   height: `${eyelidHeightPct.toFixed(1)}%`,
                   background:
@@ -431,42 +474,20 @@ export const GameHud: React.FC<GameHudProps> = ({
               }`}
             >
               {cloudFrac >= 0.68
-                ? `⚠ ТЕМНІЄ В ОЧАХ (${Math.round(phys.consciousnessPct)}%) — ВТРАТА СВІДОМОСТІ!`
-                : `😵 ПАМОРОЧИТЬСЯ ГОЛОВА (${Math.round(phys.consciousnessPct)}%) — СВІДОМІСТЬ ЗГАСАЄ`}
+                ? txt(`⚠ ТЕМНІЄ В ОЧАХ (${Math.round(phys.consciousnessPct)}%) — ВТРАТА СВІДОМОСТІ!`)
+                : txt(`😵 ПАМОРОЧИТЬСЯ ГОЛОВА (${Math.round(phys.consciousnessPct)}%) — СВІДОМІСТЬ ЗГАСАЄ`)}
             </div>
           </div>
         )}
 
-      {/* Brain Damage Visual Distortion & Phantom Hallucination Layer */}
-      {hallucFrac > 0.16 && (
+      {/* Lightweight Edge Distortion Tint during Brain Damage (3D Phantoms handle illusions in-world) */}
+      {hallucFrac > 0.18 && !isKnockedOut && (
         <div
-          className="absolute inset-0 pointer-events-none"
+          className="absolute inset-0 pointer-events-none transition-opacity duration-300"
           style={{
-            boxShadow: `inset 0 0 ${Math.round(55 + hallucFrac * 90)}px rgba(${Math.round(130 + hallucFrac * 80)}, 16, ${Math.round(70 + hallucFrac * 120)}, ${(0.22 + hallucFrac * 0.45).toFixed(2)})`,
-            transform: `skewX(${(Math.sin(fxPhase * 2.4) * hallucFrac * 1.8).toFixed(2)}deg)`,
+            boxShadow: `inset 0 0 ${Math.round(50 + hallucFrac * 85)}px rgba(${Math.round(135 + hallucFrac * 75)}, 14, ${Math.round(75 + hallucFrac * 110)}, ${(0.18 + hallucFrac * 0.36).toFixed(2)})`,
           }}
-        >
-          {hallucFrac > 0.28 && (
-            <>
-              <div
-                className="absolute w-24 h-56 rounded-full bg-black/55 blur-xl"
-                style={{
-                  left: `${12 + Math.sin(fxPhase * 0.9) * 8}%`,
-                  top: `${26 + Math.cos(fxPhase * 1.1) * 14}%`,
-                  opacity: Math.min(0.75, hallucFrac * 0.8),
-                }}
-              />
-              <div
-                className="absolute w-20 h-48 rounded-full bg-purple-950/50 blur-xl"
-                style={{
-                  right: `${10 + Math.cos(fxPhase * 1.2) * 9}%`,
-                  top: `${30 + Math.sin(fxPhase * 0.8) * 15}%`,
-                  opacity: Math.min(0.7, hallucFrac * 0.75),
-                }}
-              />
-            </>
-          )}
-        </div>
+        />
       )}
 
       {/* Inward Tunnel-Vision Vignette (Blood loss / Consciousness / Post-Wake / Overdose) */}
@@ -757,7 +778,7 @@ export const GameHud: React.FC<GameHudProps> = ({
         </div>
       )}
 
-      {/* Live Bot Speech & Combat Event Feed (Top Center-Right) */}
+      {/* Combat & Medical Event Feed (Top Center-Right; Bot speech moved overhead) */}
       {!editMode && snapshot.feed.length > 0 && (
         <div className="absolute top-16 right-3 max-w-xs space-y-1 pointer-events-none text-right">
           {snapshot.feed.slice(0, 3).map((msg) => (
@@ -773,7 +794,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                       : 'border-white/10 text-slate-200'
               }`}
             >
-              {msg.text}
+              {txt(msg.text)}
             </div>
           ))}
         </div>
@@ -824,19 +845,23 @@ export const GameHud: React.FC<GameHudProps> = ({
 
           <div className="space-y-0.5 min-w-[148px]">
             <div className="flex items-center justify-between gap-2">
-              <span className="text-slate-400">Кров</span>
+              <span className="text-slate-400">{txt('Кров')}</span>
               <span className="font-mono-num font-bold text-red-400">
-                {Math.round(phys.bloodVolumeMl)} mL
+                {hallucFrac > 0.55 && glitchSeed % 5 === 0
+                  ? txt('??? mL', 0.22)
+                  : txt(`${Math.round(phys.bloodVolumeMl)} mL`)}
               </span>
             </div>
             <div className="flex items-center justify-between gap-2">
-              <span className="text-slate-400">Пульс / SpO2</span>
+              <span className="text-slate-400">{txt('Пульс / SpO2')}</span>
               <span className="font-mono-num font-bold text-emerald-400">
-                {Math.round(phys.heartRateBpm)} · {Math.round(phys.oxygenPct)}%
+                {hallucFrac > 0.58 && glitchSeed % 4 === 1
+                  ? txt(`${Math.round(phys.heartRateBpm + 42)} · ??%`, 0.2)
+                  : txt(`${Math.round(phys.heartRateBpm)} · ${Math.round(phys.oxygenPct)}%`)}
               </span>
             </div>
             <div className="flex items-center justify-between gap-2">
-              <span className="text-slate-400">Свід. / Орг.</span>
+              <span className="text-slate-400">{txt('Свід. / Орг.')}</span>
               <span
                 className={`font-mono-num font-bold ${
                   phys.consciousnessPct < 45 || phys.organHealth < 45
@@ -844,11 +869,11 @@ export const GameHud: React.FC<GameHudProps> = ({
                     : 'text-sky-300'
                 }`}
               >
-                {Math.round(phys.consciousnessPct)}% · {Math.round(phys.organHealth)}%
+                {txt(`${Math.round(phys.consciousnessPct)}% · ${Math.round(phys.organHealth)}%`)}
               </span>
             </div>
             <div className="flex items-center justify-between gap-2">
-              <span className="text-slate-400">Імунітет</span>
+              <span className="text-slate-400">{txt('Імунітет')}</span>
               <span
                 className={`font-mono-num font-bold ${
                   phys.immunityPct < 35
@@ -858,18 +883,19 @@ export const GameHud: React.FC<GameHudProps> = ({
                       : 'text-emerald-400'
                 }`}
               >
-                {Math.round(phys.immunityPct)}%
-                {phys.antibioticLevel > 2 ? ' · АБХ' : ''}
+                {txt(
+                  `${Math.round(phys.immunityPct)}%${phys.antibioticLevel > 2 ? ' · АБХ' : ''}`,
+                )}
               </span>
             </div>
             {(totalBleed > 0.3 || phys.internalBleedRate > 0.2) && (
               <div className="text-[11px] font-mono-num text-red-400 font-semibold">
-                Кровотеча: -{(totalBleed + phys.internalBleedRate).toFixed(1)} mL/s
+                {txt(`Кровотеча: -${(totalBleed + phys.internalBleedRate).toFixed(1)} mL/s`)}
               </div>
             )}
             {phys.infectionPhase === 2 && (
               <div className="text-[11px] font-semibold text-lime-300">
-                ☣ ІНФЕКЦІЯ Ф.2 ({Math.round(phys.sepsis)}% сепсис)
+                {txt(`☣ ІНФЕКЦІЯ Ф.2 (${Math.round(phys.sepsis)}% сепсис)`)}
               </div>
             )}
             {worstOrgan.val < 78 && (
@@ -878,17 +904,17 @@ export const GameHud: React.FC<GameHudProps> = ({
                   worstOrgan.val < 42 ? 'text-red-400' : 'text-amber-300'
                 }`}
               >
-                ⚠ {worstOrgan.label}: {Math.round(worstOrgan.val)}%
+                {txt(`⚠ ${worstOrgan.label}: ${Math.round(worstOrgan.val)}%`)}
               </div>
             )}
             {phys.postWakeDebuffTimer > 0 && (
               <div className="text-[11px] font-semibold text-sky-300">
-                😵 Дезорієнтація ({Math.ceil(phys.postWakeDebuffTimer)}с)
+                {txt(`😵 Дезорієнтація (${Math.ceil(phys.postWakeDebuffTimer)}с)`)}
               </div>
             )}
             {phys.overdose !== 'none' && (
               <div className="text-[11px] font-semibold text-purple-300">
-                ПЕРЕДОЗ ({phys.overdose.toUpperCase()})
+                {txt(`ПЕРЕДОЗ (${phys.overdose.toUpperCase()})`)}
               </div>
             )}
           </div>
@@ -908,19 +934,21 @@ export const GameHud: React.FC<GameHudProps> = ({
         className={`absolute rounded-md bg-[#0b0e14]/88 border border-white/12 p-2.5 text-right pointer-events-auto ${editBoxClass}`}
       >
         <div className="text-xs font-display font-bold text-white">
-          {activeDef.nameUk}
+          {txt(activeDef.nameUk)}
         </div>
         <div className="text-[11px] text-slate-400 mb-1.5">
           {activeDef.kind === 'firearm' ? (
             <span className="font-mono-num text-sm font-bold text-amber-300">
-              {inventory.magAmmo[activeWeapon]} / {inventory.reserveAmmo[activeDef.caliber]}
+              {hallucFrac > 0.56 && glitchSeed % 6 === 2
+                ? txt('?? / ??', 0.2)
+                : txt(`${inventory.magAmmo[activeWeapon]} / ${inventory.reserveAmmo[activeDef.caliber]}`)}
             </span>
           ) : activeDef.id === 'frag_grenade' ? (
             <span className="font-mono-num text-sm font-bold text-amber-300">
-              x{inventory.reserveAmmo.frag}
+              {txt(`x${inventory.reserveAmmo.frag}`)}
             </span>
           ) : (
-            <span>{activeDef.nameEn}</span>
+            <span>{txt(activeDef.nameEn)}</span>
           )}
         </div>
         {/* Weapon strip */}
@@ -1129,8 +1157,8 @@ export const GameHud: React.FC<GameHudProps> = ({
             {editMode
               ? 'Кнопка дії / Interact'
               : snapshot.nearbyPrompt?.type === 'loot'
-                ? `[E] Обшукати: ${snapshot.nearbyPrompt.labelUk}`
-                : `${snapshot.nearbyPrompt?.labelUk} — [G] Жести`}
+                ? txt(`[E] Обшукати: ${snapshot.nearbyPrompt.labelUk}`)
+                : txt(`${snapshot.nearbyPrompt?.labelUk ?? ''} — [G] Жести`)}
           </span>
         </button>
       )}

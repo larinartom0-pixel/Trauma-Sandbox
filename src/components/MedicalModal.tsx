@@ -10,7 +10,7 @@ import {
   Syringe,
   X,
 } from 'lucide-react';
-import { LIMB_META, MED_ITEM_DEFS } from '../game/data';
+import { corruptText, LIMB_META, MED_ITEM_DEFS } from '../game/data';
 import { getEffectiveLimbBleed } from '../game/physiology';
 import {
   GridInventoryItem,
@@ -259,6 +259,19 @@ export const MedicalModal: React.FC<MedicalModalProps> = ({
       : 0,
   );
   const [veinOffsetPct, setVeinOffsetPct] = useState(50);
+  const hallucFrac = Math.max(0, Math.min(1, phys.hallucinationLevel / 100));
+  const [medGlitchSeed, setMedGlitchSeed] = useState(1);
+
+  useEffect(() => {
+    if (phys.hallucinationLevel <= 24) return;
+    const id = window.setInterval(() => {
+      setMedGlitchSeed((s) => (s + 1) % 997);
+    }, 300);
+    return () => window.clearInterval(id);
+  }, [phys.hallucinationLevel]);
+
+  const mTxt = (str: string) =>
+    hallucFrac > 0.24 ? corruptText(str, hallucFrac * 0.85, medGlitchSeed) : str;
 
   // CRT Phosphor-Green ECG Canvas
   const ecgCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -919,10 +932,10 @@ export const MedicalModal: React.FC<MedicalModalProps> = ({
         <div className="lg:col-span-4 rounded-sm bg-[#232930] border-2 border-[#47515c] p-2 shadow-2xl flex flex-col gap-1.5 font-mono-num">
           <div className="bg-[#0a1611] border border-[#3a4a42] px-2.5 py-1.5 text-[#4ade80]">
             <div className="text-[13px] font-extrabold tracking-widest leading-none">
-              EXPERIMENT
+              {mTxt('EXPERIMENT')}
             </div>
             <div className="text-[11px] text-[#34d399] mt-0.5">
-              176cm | 24y | #26761
+              {mTxt('176cm | 24y | #26761')}
             </div>
           </div>
 
@@ -935,7 +948,7 @@ export const MedicalModal: React.FC<MedicalModalProps> = ({
             }}
           >
             <div className="text-center text-xs font-bold tracking-widest border-b border-dashed border-[#4ade80]/30 pb-1">
-              UNI-HEALTH v2.09
+              {mTxt('UNI-HEALTH v2.09')}
             </div>
 
             <div className="space-y-1">
@@ -1124,8 +1137,7 @@ export const MedicalModal: React.FC<MedicalModalProps> = ({
                     <div key={oid} className="space-y-0.5">
                       <div className={`flex justify-between font-bold ${textCls}`}>
                         <span>
-                          {label}
-                          {tag !== 'OK' ? ` · ${tag}` : ''}
+                          {mTxt(`${label}${tag !== 'OK' ? ` · ${tag}` : ''}`)}
                         </span>
                         <span>{val}%</span>
                       </div>
@@ -1142,8 +1154,7 @@ export const MedicalModal: React.FC<MedicalModalProps> = ({
           {/* Bottom CRT Sub-Panel: Selected Limb */}
           <div className="bg-[#091510] border border-[#3a4a42] p-2.5 text-[#4ade80] text-[11px]">
             <div className="text-center font-bold tracking-wider border-b border-dashed border-[#4ade80]/30 pb-1 mb-1.5 uppercase">
-              {LIMB_META[selectedLimb].nameEn} ·{' '}
-              {LIMB_META[selectedLimb].nameUk}
+              {mTxt(`${LIMB_META[selectedLimb].nameEn} · ${LIMB_META[selectedLimb].nameUk}`)}
             </div>
 
             <div className="space-y-1">

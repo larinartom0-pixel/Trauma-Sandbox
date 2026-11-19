@@ -73,6 +73,9 @@ export interface BotEntity {
   deadTimer: number;
   aggroBotId: string | null;
   aggroBotTimer: number;
+  speechText: string | null;
+  speechTone: 'neutral' | 'warn' | 'danger' | 'friendly';
+  speechTimer: number;
 }
 
 const _tmpVec = new THREE.Vector3();
@@ -480,6 +483,9 @@ export class BotManager {
       deadTimer: 0,
       aggroBotId: null,
       aggroBotTimer: 0,
+      speechText: null,
+      speechTone: 'neutral',
+      speechTimer: 0,
     };
     this.bots.push(bot);
     this.meshesDirty = true;
@@ -639,7 +645,7 @@ export class BotManager {
     if (fracturedNow && limbId === 'rightArm' && Math.random() < 0.7) {
       bot.weapon = 'hands';
       bot.rig.weaponMount.clear();
-      this.onBotSpeech(`${bot.nameUk}: Рука зламана! Зброя випала!`, 'neutral');
+      this.speak(bot, 'Рука зламана! Зброя випала!', 'neutral', 3.4);
     }
 
     if (
@@ -650,7 +656,7 @@ export class BotManager {
       if (bot.disposition !== 'hostile') {
         bot.disposition = 'hostile';
         bot.trust = -100;
-        this.onBotSpeech(`${bot.nameUk}: Контакт! Займаю укриття!`, 'danger');
+        this.speak(bot, 'Контакт! Займаю укриття!', 'danger', 3.4);
       }
       bot.lastKnownPlayerPos = this.lastKnownGlobalPlayerPos.clone();
 
@@ -709,7 +715,7 @@ export class BotManager {
           bot.aiState = 'engage';
         }
         if (bot.pos.distanceTo(this.lastKnownGlobalPlayerPos) < 34) {
-          this.onBotSpeech(`${bot.nameUk}: По мені стріляють! Вогонь у відповідь!`, 'warn');
+          this.speak(bot, 'По мені стріляють! Вогонь у відповідь!', 'warn', 3.2);
         }
       }
     }
@@ -1058,28 +1064,29 @@ export class BotManager {
         if (bot.disposition === 'cautious') {
           bot.trust = Math.min(100, bot.trust + 40);
           bot.aiState = 'patrol';
-          this.onBotSpeech(`${bot.nameUk}: Зрозумів, я не ворог. / Easy, we're cool.`, 'neutral');
           if (bot.trust >= 50) {
             bot.disposition = 'friendly';
-            this.onBotSpeech(`${bot.nameUk} тепер довіряє вам. / Trusts you now.`, 'friendly');
+            this.speak(bot, 'Гаразд, тепер я тобі довіряю.', 'friendly', 3.8);
+          } else {
+            this.speak(bot, 'Зрозумів, я не ворог.', 'neutral', 3.4);
           }
         } else if (bot.disposition === 'friendly') {
-          this.onBotSpeech(`${bot.nameUk}: Прикрию якщо що! / Got your back!`, 'friendly');
+          this.speak(bot, 'Прикрию якщо що!', 'friendly', 3.2);
         } else {
-          this.onBotSpeech(`${bot.nameUk}: (Ігнорує мирний жест) / Ignores peace sign!`, 'danger');
+          this.speak(bot, 'Пізно домовлятись!', 'danger', 3.0);
         }
       } else if (gesture === 'follow') {
         if (bot.disposition === 'friendly') {
           bot.aiState = 'follow';
           bot.repathTimer = 0;
-          this.onBotSpeech(`${bot.nameUk}: Йду за тобою! / Following!`, 'friendly');
+          this.speak(bot, 'Йду за тобою!', 'friendly', 3.4);
         } else if (bot.disposition === 'cautious') {
-          this.onBotSpeech(`${bot.nameUk}: Тримайся сам. / I walk alone.`, 'warn');
+          this.speak(bot, 'Тримайся сам.', 'warn', 3.2);
         }
       } else if (gesture === 'hold') {
         if (bot.disposition === 'friendly') {
           bot.aiState = 'hold';
-          this.onBotSpeech(`${bot.nameUk}: Чекаю тут. / Holding position.`, 'friendly');
+          this.speak(bot, 'Чекаю тут.', 'friendly', 3.2);
         }
       } else if (gesture === 'intimidate') {
         if (bot.archetype === 'infected') {
@@ -1102,12 +1109,12 @@ export class BotManager {
           bot.rig.root.traverse((c) => {
             c.userData.lootId = bot.loot.id;
           });
-          this.onBotSpeech(`${bot.nameUk}: Тільки не стріляй! Здаюсь! / I surrender!`, 'warn');
+          this.speak(bot, 'Тільки не стріляй! Здаюсь!', 'warn', 4.0);
         } else if (bot.disposition === 'cautious') {
           bot.disposition = 'hostile';
           bot.aiState = 'engage';
           bot.lastKnownPlayerPos = playerPos.clone();
-          this.onBotSpeech(`${bot.nameUk}: Погрожуєш мені?! / Big mistake!`, 'danger');
+          this.speak(bot, 'Погрожуєш мені?!', 'danger', 3.4);
         }
       } else if (gesture === 'request_med') {
         if (bot.disposition === 'friendly') {
@@ -1133,12 +1140,12 @@ export class BotManager {
                 1.2,
               );
             this.onSpawnMedDrop(dropPos, avail);
-            this.onBotSpeech(`${bot.nameUk}: Тримай медикаменти! / Dropped medical pouch!`, 'friendly');
+            this.speak(bot, 'Тримай медикаменти!', 'friendly', 3.6);
           } else {
-            this.onBotSpeech(`${bot.nameUk}: Аптечка вже порожня! / Out of meds!`, 'neutral');
+            this.speak(bot, 'Аптечка вже порожня!', 'neutral', 3.2);
           }
         } else {
-          this.onBotSpeech(`${bot.nameUk}: Знайдеш у місті сам! / Find your own!`, 'warn');
+          this.speak(bot, 'Знайдеш у місті сам!', 'warn', 3.2);
         }
       } else if (gesture === 'taunt') {
         if (bot.disposition === 'cautious') {
@@ -1147,20 +1154,31 @@ export class BotManager {
         if (bot.disposition === 'hostile') {
           bot.aiState = 'engage';
           bot.lastKnownPlayerPos = playerPos.clone();
-          this.onBotSpeech(`${bot.nameUk}: Ну давай! / Come get some!`, 'danger');
+          this.speak(bot, 'Ну давай!', 'danger', 3.2);
         }
       }
     }
 
     if (!reacted) {
-      this.onBotSpeech('Поруч нікого немає / No bots nearby', 'neutral');
+      void this.onBotSpeech;
     }
+  }
+
+  private speak(
+    bot: BotEntity,
+    text: string,
+    tone: 'neutral' | 'warn' | 'danger' | 'friendly',
+    duration = 3.4,
+  ) {
+    bot.speechText = text;
+    bot.speechTone = tone;
+    bot.speechTimer = duration;
   }
 
   /**
    * Exact Ray-AABB Line-of-Sight check: returns true if clear, false if wall/car blocks!
    */
-  private hasLineOfSight(
+  public hasLineOfSight(
     from: THREE.Vector3,
     to: THREE.Vector3,
     fromY = 1.45,
@@ -1328,7 +1346,7 @@ export class BotManager {
         bot.repathTimer = 0;
       }
       if (bot.pos.distanceTo(this.lastKnownGlobalPlayerPos) < 28) {
-        this.onBotSpeech(`${bot.nameUk}: Перезаряджаюсь! / Reloading!`, 'neutral');
+        this.speak(bot, 'Перезаряджаюсь!', 'neutral', 2.4);
       }
       return;
     }
@@ -1450,7 +1468,15 @@ export class BotManager {
     }
 
     for (const bot of this.bots) {
+      if (bot.speechTimer > 0) {
+        bot.speechTimer -= dt;
+        if (bot.speechTimer <= 0) {
+          bot.speechText = null;
+        }
+      }
+
       if (bot.aiState === 'dead') {
+        bot.speechText = null;
         if (bot.ragdollNodes && !bot.grabbedByCrusher) {
           this.stepRagdoll(bot, dt);
         }
@@ -1468,6 +1494,7 @@ export class BotManager {
         bot.phys.consciousness === 'unconscious' ||
         bot.phys.consciousness === 'cardiacArrest'
       ) {
+        bot.speechText = null;
         this.dropBotUnconscious(bot);
         if (bot.ragdollNodes && !bot.grabbedByCrusher) {
           this.stepRagdoll(bot, dt);
@@ -1523,7 +1550,7 @@ export class BotManager {
             bot.repathTimer = 0;
           }
           if (distToPlayer < 26) {
-            this.onBotSpeech(`${bot.nameUk}: Перев’язую рану! / Bandaging up!`, 'neutral');
+            this.speak(bot, 'Перев’язую рану!', 'neutral', 2.8);
           }
         } else if (
           (bot.phys.bloodVolumeMl < 2750 || bot.phys.organHealth < 45) &&
@@ -1539,7 +1566,7 @@ export class BotManager {
           );
           bot.repathTimer = 0;
           if (distToPlayer < 26) {
-            this.onBotSpeech(`${bot.nameUk}: Відступаю! / Falling back!`, 'warn');
+            this.speak(bot, 'Відступаю!', 'warn', 2.8);
           }
         }
       }
@@ -1556,12 +1583,12 @@ export class BotManager {
             bot.trust -= dt * 32;
             if (bot.aiState !== 'warn') {
               bot.aiState = 'warn';
-              this.onBotSpeech(`${bot.nameUk}: Прибери ствол! / Lower your weapon!`, 'warn');
+              this.speak(bot, 'Прибери ствол!', 'warn', 3.0);
             }
             if (bot.trust <= -20) {
               bot.disposition = 'hostile';
               bot.aiState = 'engage';
-              this.onBotSpeech(`${bot.nameUk}: Ти сам напросився! / You asked for it!`, 'danger');
+              this.speak(bot, 'Ти сам напросився!', 'danger', 3.0);
             }
           } else if (distToPlayer < 6.5 && playerArmed) {
             bot.aiState = 'warn';

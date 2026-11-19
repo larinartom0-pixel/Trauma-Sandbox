@@ -239,6 +239,144 @@ class SoundEngine {
       osc.stop(t + 0.11);
     }
   }
+
+  private connectWithPan(
+    ctx: AudioContext,
+    source: AudioNode,
+    pan: number,
+  ) {
+    if (typeof ctx.createStereoPanner === 'function') {
+      const panner = ctx.createStereoPanner();
+      panner.pan.value = Math.max(-1, Math.min(1, pan));
+      source.connect(panner);
+      panner.connect(ctx.destination);
+    } else {
+      source.connect(ctx.destination);
+    }
+  }
+
+  playSpatialGunshot(weapon: WeaponId, pan: number, dist: number) {
+    const ctx = this.ensureContext();
+    if (!ctx || !this.noiseBuffer) return;
+
+    const now = ctx.currentTime;
+    const isHeavy = weapon === 'shotgun_12ga' || weapon === 'sniper_762';
+    const dur = isHeavy ? 0.28 : 0.16;
+    const atten = Math.max(0.08, Math.min(1, 1 - dist / 46));
+
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.setValueAtTime(
+      (isHeavy ? 620 : 1150) * Math.max(0.45, atten),
+      now,
+    );
+    filter.frequency.exponentialRampToValueAtTime(140, now + dur);
+    filter.Q.value = 0.85;
+
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime((isHeavy ? 0.45 : 0.3) * atten, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
+
+    src.connect(filter);
+    filter.connect(gain);
+    this.connectWithPan(ctx, gain, pan);
+    src.start(now);
+    src.stop(now + dur + 0.02);
+  }
+
+  playSpatialFootsteps(pan: number, dist: number, steps = 3) {
+    const ctx = this.ensureContext();
+    if (!ctx || !this.noiseBuffer) return;
+
+    const now = ctx.currentTime;
+    const atten = Math.max(0.12, Math.min(0.95, 1 - dist / 24));
+    for (let s = 0; s < steps; s++) {
+      const t = now + s * (0.28 + Math.random() * 0.06);
+      const src = ctx.createBufferSource();
+      src.buffer = this.noiseBuffer;
+
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(340 + Math.random() * 140, t);
+      bp.Q.value = 1.4;
+
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.24 * atten, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.085);
+
+      src.connect(bp);
+      bp.connect(gain);
+      this.connectWithPan(ctx, gain, pan);
+      src.start(t);
+      src.stop(t + 0.095);
+    }
+  }
+
+  playSpatialReloadClick(pan: number, dist: number) {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+
+    const now = ctx.currentTime;
+    const atten = Math.max(0.15, Math.min(1, 1 - dist / 22));
+    for (let i = 0; i < 2; i++) {
+      const t = now + i * 0.14;
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(i === 0 ? 1150 : 1580, t);
+      osc.frequency.exponentialRampToValueAtTime(340, t + 0.045);
+
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.16 * atten, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
+
+      osc.connect(gain);
+      this.connectWithPan(ctx, gain, pan);
+      osc.start(t);
+      osc.stop(t + 0.055);
+    }
+  }
+
+  playPhantomWhisper(pan: number) {
+    const ctx = this.ensureContext();
+    if (!ctx || !this.noiseBuffer) return;
+
+    const now = ctx.currentTime;
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(1750, now);
+    bp.frequency.linearRampToValueAtTime(920, now + 0.45);
+    bp.Q.value = 4.2;
+
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.001, now);
+    gain.gain.linearRampToValueAtTime(0.14, now + 0.09);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.52);
+
+    src.connect(bp);
+    bp.connect(gain);
+    this.connectWithPan(ctx, gain, pan);
+    src.start(now);
+    src.stop(now + 0.55);
+
+    // Subtle auditory tinnitus pitch
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(2450 + Math.random() * 400, now);
+    const tGain = ctx.createGain();
+    tGain.gain.setValueAtTime(0.001, now);
+    tGain.gain.linearRampToValueAtTime(0.032, now + 0.08);
+    tGain.gain.exponentialRampToValueAtTime(0.0008, now + 0.65);
+    osc.connect(tGain);
+    this.connectWithPan(ctx, tGain, pan * 0.5);
+    osc.start(now);
+    osc.stop(now + 0.68);
+  }
 }
 
 export const soundEngine = new SoundEngine();
