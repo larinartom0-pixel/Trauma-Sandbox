@@ -1,6 +1,12 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { BotEntity, BotManager } from './ai';
+import {
+  createProceduralAnimState,
+  ProceduralAnimState,
+  shiftRagdoll,
+  stepProceduralCharacterAnim,
+} from './animation';
 import { soundEngine } from './audio';
 import { BACKPACK_TIERS, detectTouchMode, WEAPON_DEFS } from './data';
 import {
@@ -82,6 +88,8 @@ interface InstancedParticlePool {
 interface PhantomEntity {
   id: string;
   rig: GoreDollRig;
+  animState: ProceduralAnimState;
+  recoilPulse: number;
   hitMeshes: THREE.Mesh[];
   active: boolean;
   behavior: 'stalker' | 'runner' | 'ambush';
@@ -156,6 +164,8 @@ export class TraumaSandboxEngine {
   private shakeIntensity = 0;
   private swayPhase = 0;
   private playerRig: GoreDollRig | null = null;
+  private playerAnimState: ProceduralAnimState = createProceduralAnimState();
+  private playerRecoilPulse = 0;
 
   // Input state (PC + Touch + Drag-to-Look fallback)
   private keys = new Set<string>();
@@ -484,6 +494,8 @@ export class TraumaSandboxEngine {
       this.phantoms.push({
         id,
         rig,
+        animState: createProceduralAnimState(),
+        recoilPulse: 0,
         hitMeshes,
         active: false,
         behavior: 'stalker',
@@ -1441,15 +1453,9 @@ export class TraumaSandboxEngine {
       const bot = this.grabbedTarget.bot;
       bot.grabbedByCrusher = false;
       bot.vel.copy(_dir).multiplyScalar(launchSpeed * 0.75);
-      if (bot.ragdollNodes && bot.ragdollNodes.length >= 7) {
-        const shiftX = bot.pos.x - bot.ragdollNodes[0].pos.x;
-        const shiftZ = bot.pos.z - bot.ragdollNodes[0].pos.z;
-        for (const n of bot.ragdollNodes) {
-          n.pos.x += shiftX;
-          n.pos.y += 1.0;
-          n.pos.z += shiftZ;
-          n.prevPos.copy(n.pos).addScaledVector(_dir, -launchSpeed * 0.012);
-        }
+      if (bot.ragdoll && bot.ragdoll.nodes.length >= 11) {
+        const imp = _dir.clone().multiplyScalar(launchSpeed * 0.015);
+        shiftRagdoll(bot.ragdoll, 0, 0.05, 0, imp);
       }
       if (fling && bot.aiState !== 'dead') {
         this.botManager.damageBotLimb(bot.id, 'torso', 42, 1.8, 0.45, 0, _dir, true);
@@ -1491,6 +1497,7 @@ export class TraumaSandboxEngine {
     if (def.kind === 'melee' || def.kind === 'unarmed') {
       this.fireCooldownMs = def.fireRateMs;
       this.meleeSwingTimer = 0.24;
+      this.playerRecoilPulse = 1.0;
       soundEngine.playMeleeSwing(def.damage > 45);
       _dir.set(0, 0, -1).applyEuler(this.camera.rotation);
       _raycaster.set(this.camera.position, _dir);
@@ -1534,6 +1541,7 @@ export class TraumaSandboxEngine {
     this.fireCooldownMs = def.fireRateMs;
     this.viewKickZ = 0.075;
     this.recoilPitch += def.recoil;
+    this.playerRecoilPulse = 1.0;
     this.flashLight.intensity = 5.5;
     this.flashTimer = 0.055;
     soundEngine.playGunshot(this.activeWeapon);
@@ -2236,16 +2244,40 @@ export class TraumaSandboxEngine {
           ? Math.sin(elapsed * (leftBroken || rightBroken ? 6 : 10)) * 0.035
           : 0;
 
+      this.playerRecoilPulse = THREE.MathUtils.damp(this.playerRecoilPulse, 0, 16, dt);
       if (this.cameraMode === 'third') {
         this.viewmodelMount.visible = false;
         if (this.playerRig) {
           this.playerRig.root.visible = true;
           this.playerRig.root.position.copy(this.playerPos);
-          this.playerRig.root.rotation.set(knockedOut ? -Math.PI / 2 : 0, this.playerYaw + Math.PI, 0);
-          const stride = len > 0.1 ? Math.sin(elapsed * 9) * 0.45 : 0;
-          this.playerRig.limbs.leftLeg.rotation.x = stride;
-          this.playerRig.limbs.rightLeg.rotation.x = -stride;
-          this.playerRig.limbs.rightArm.rotation.x = -1.25;
+          this.playerRig.root.rotation.set(
+            knockedOut ? -Math.PI / 2 : 0,
+            this.playerYaw + Math.PI,
+            0,
+          );
+          const twoHanded =
+            this.activeWeapon === 'rifle_556' ||
+            this.activeWeapon === 'shotgun_12ga' ||
+            this.activeWeapon === 'sniper_762';
+          stepProceduralCharacterAnim(this.playerRig, this.playerAnimState, {
+            dt,
+            moveSpeed: len > 0.1 && !knockedOut ? speed : 0,
+            crouchFactor: this.isCrouching ? 1 : 0,
+            aiming: this.activeWeapon !== 'hands' && !knockedOut,
+            crawling: (leftBroken && rightBroken) && !knockedOut,
+            surrendering: false,
+            healing: false,
+            reloading: this.isReloading,
+            woundedFrac: Math.min(
+              1,
+              Math.max(0, 1 - this.phys.bloodVolumeMl / 5000) + this.phys.pain / 120,
+            ),
+            legInjured: leftBroken || rightBroken,
+            recoilPulse: this.playerRecoilPulse,
+            flinchPitch: 0,
+            flinchRoll: 0,
+            twoHandedWeapon: twoHanded,
+          });
         }
         // Over-the-shoulder chase camera
         const backX = sinY * 2.4 + cosY * 0.55;
@@ -2358,9 +2390,13 @@ export class TraumaSandboxEngine {
         p.mesh.rotation.y += dt * 1.4;
       } else {
         const b = this.grabbedTarget.bot;
-        b.pos.lerp(holdPos, Math.min(1, dt * 12));
-        b.rig.root.position.copy(b.pos);
-        b.rig.root.rotation.z = Math.sin(elapsed * 5) * 0.25;
+        if (b.ragdoll && b.ragdoll.nodes.length >= 11) {
+          this.botManager.stepGrabbedRagdoll(b, holdPos, dt);
+        } else {
+          b.pos.lerp(holdPos, Math.min(1, dt * 12));
+          b.rig.root.position.copy(b.pos);
+          b.rig.root.rotation.z = Math.sin(elapsed * 5) * 0.25;
+        }
       }
 
       const start = this.camera.position
@@ -2640,25 +2676,17 @@ export class TraumaSandboxEngine {
         ph.aimedTime = Math.max(0, ph.aimedTime - dt * 0.5);
       }
 
+      ph.recoilPulse = THREE.MathUtils.damp(ph.recoilPulse, 0, 14, dt);
       if (ph.behavior === 'runner') {
         ph.pos.addScaledVector(ph.vel, dt);
-        const stride = Math.sin(elapsed * 11) * 0.55;
-        ph.rig.limbs.leftLeg.rotation.x = stride;
-        ph.rig.limbs.rightLeg.rotation.x = -stride;
-        ph.rig.limbs.leftArm.rotation.x = -stride * 0.6;
-        ph.rig.limbs.rightArm.rotation.x = stride * 0.6;
       } else {
         ph.yaw = Math.atan2(
           this.playerPos.x - ph.pos.x,
           this.playerPos.z - ph.pos.z,
         );
-        ph.rig.limbs.leftLeg.rotation.x = 0;
-        ph.rig.limbs.rightLeg.rotation.x = 0;
-        ph.rig.limbs.leftArm.rotation.x = -0.35;
-        ph.rig.limbs.rightArm.rotation.x = -1.35;
-
         if (ph.behavior === 'ambush' && !ph.firedFakeShot && ph.life < ph.maxLife * 0.55) {
           ph.firedFakeShot = true;
+          ph.recoilPulse = 1.0;
           this.phantomFlashLight.position.set(ph.pos.x, 1.4, ph.pos.z);
           this.phantomFlashLight.intensity = 6.5;
           this.phantomFlashTimer = 0.08;
@@ -2669,6 +2697,22 @@ export class TraumaSandboxEngine {
 
       ph.rig.root.position.copy(ph.pos);
       ph.rig.root.rotation.set(0, ph.yaw, 0);
+      stepProceduralCharacterAnim(ph.rig, ph.animState, {
+        dt,
+        moveSpeed: ph.behavior === 'runner' ? ph.vel.length() : 0,
+        crouchFactor: ph.behavior === 'ambush' ? 0.35 : 0,
+        aiming: ph.behavior !== 'runner',
+        crawling: false,
+        surrendering: false,
+        healing: false,
+        reloading: false,
+        woundedFrac: 0,
+        legInjured: false,
+        recoilPulse: ph.recoilPulse,
+        flinchPitch: 0,
+        flinchRoll: 0,
+        twoHandedWeapon: ph.behavior === 'stalker' || ph.behavior === 'ambush',
+      });
     }
   }
 

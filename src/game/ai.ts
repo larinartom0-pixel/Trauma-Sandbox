@@ -1,4 +1,14 @@
 import * as THREE from 'three';
+import {
+  createProceduralAnimState,
+  createRagdollState,
+  ProceduralAnimState,
+  RagdollState,
+  resetGoreDollPose,
+  stepArticulatedRagdoll,
+  stepProceduralCharacterAnim,
+  wakeRagdoll,
+} from './animation';
 import { soundEngine } from './audio';
 import { WEAPON_DEFS } from './data';
 import { buildGridFromLoot, syncLootFromGrid } from './inventory';
@@ -26,12 +36,6 @@ import {
 } from './types';
 import { BuildingZone, DynamicProp, WallCollider, WORLD_BOUND } from './world';
 
-export interface RagdollNode {
-  pos: THREE.Vector3;
-  prevPos: THREE.Vector3;
-  limbId: LimbId;
-}
-
 export interface BotEntity {
   id: string;
   nameUk: string;
@@ -41,6 +45,10 @@ export interface BotEntity {
   aiState: BotAIState;
   trust: number;
   rig: GoreDollRig;
+  animState: ProceduralAnimState;
+  recoilPulse: number;
+  flinchPitch: number;
+  flinchRoll: number;
   pos: THREE.Vector3;
   vel: THREE.Vector3;
   yaw: number;
@@ -66,7 +74,7 @@ export interface BotEntity {
   repathTimer: number;
   stuckTimer: number;
   lastProgressPos: THREE.Vector3;
-  ragdollNodes: RagdollNode[] | null;
+  ragdoll: RagdollState | null;
   loot: LootBundle;
   lootDropped: boolean;
   grabbedByCrusher: boolean;
@@ -82,16 +90,6 @@ const _tmpVec = new THREE.Vector3();
 const _toTarget = new THREE.Vector3();
 const _botFwd = new THREE.Vector3();
 const _sepVec = new THREE.Vector3();
-const _upY = new THREE.Vector3(0, 1, 0);
-const _rdX = new THREE.Vector3();
-const _rdY = new THREE.Vector3();
-const _rdZ = new THREE.Vector3();
-const _rdMat = new THREE.Matrix4();
-const _rdDir = new THREE.Vector3();
-const _rdShoulderL = new THREE.Vector3();
-const _rdShoulderR = new THREE.Vector3();
-const _rdHipL = new THREE.Vector3();
-const _rdHipR = new THREE.Vector3();
 
 function lerpAngleStep(current: number, target: number, maxStep: number): number {
   let diff = ((target - current + Math.PI) % (Math.PI * 2)) - Math.PI;
@@ -435,6 +433,10 @@ export class BotManager {
       aiState: 'patrol',
       trust: s.disposition === 'friendly' ? 65 : s.disposition === 'cautious' ? 15 : -80,
       rig,
+      animState: createProceduralAnimState(),
+      recoilPulse: 0,
+      flinchPitch: 0,
+      flinchRoll: 0,
       pos: safeSpawn.clone(),
       vel: new THREE.Vector3(),
       yaw,
@@ -460,7 +462,7 @@ export class BotManager {
       repathTimer: Math.random() * 0.5,
       stuckTimer: 0,
       lastProgressPos: safeSpawn.clone(),
-      ragdollNodes: null,
+      ragdoll: null,
       loot: {
         id: `loot_${id}`,
         labelUk: `Спорядження: ${s.nameUk}`,
@@ -632,7 +634,16 @@ export class BotManager {
 
     bot.vel.addScaledVector(impulseDir, Math.min(7, damage * 0.08));
 
-    if (severedNow) {
+    // Procedural hit flinch along impact direction relative to bot facing
+    const sinY = Math.sin(bot.yaw);
+    const cosY = Math.cos(bot.yaw);
+    const hitFwd = impulseDir.x * sinY + impulseDir.z * cosY;
+    const hitRight = impulseDir.x * cosY - impulseDir.z * sinY;
+    const flinchStrength = Math.min(0.6, 0.22 + damage * 0.008);
+    bot.flinchPitch = hitFwd * flinchStrength;
+    bot.flinchRoll = -hitRight * flinchStrength;
+
+    if (severedNow && limbId !== 'torso') {
       bot.rig.limbs[limbId].visible = false;
       this.meshesDirty = true;
       this.onSpawnBlood(bot.pos.clone().add(new THREE.Vector3(0, 1.1, 0)), 18);
@@ -736,257 +747,41 @@ export class BotManager {
   }
 
   private initRagdollNodes(bot: BotEntity, impulse?: THREE.Vector3) {
-    const sinY = Math.sin(bot.yaw);
-    const cosY = Math.cos(bot.yaw);
-    const rightX = cosY;
-    const rightZ = -sinY;
-    const fwdX = sinY;
-    const fwdZ = cosY;
-    const crouchY = 0.25 * bot.crouchFactor;
-
-    const imp = impulse
-      ? impulse.clone().clampLength(0, 8).multiplyScalar(0.025)
-      : new THREE.Vector3(
-          (Math.random() - 0.5) * 0.04,
-          0.01,
-          (Math.random() - 0.5) * 0.04,
-        );
-    const staggerX = -fwdX * 0.025 + (Math.random() - 0.5) * 0.03;
-    const staggerZ = -fwdZ * 0.025 + (Math.random() - 0.5) * 0.03;
-
-    const bx = bot.pos.x;
-    const bz = bot.pos.z;
-    const mk = (
-      limbId: LimbId,
-      x: number,
-      y: number,
-      z: number,
-      vx: number,
-      vy: number,
-      vz: number,
-    ): RagdollNode => ({
-      limbId,
-      pos: new THREE.Vector3(x, y, z),
-      prevPos: new THREE.Vector3(x - vx, y - vy, z - vz),
-    });
-
-    // 7-joint Verlet ragdoll: [0] pelvis, [1] torso(chest), [2] head, [3] leftHand, [4] rightHand, [5] leftFoot, [6] rightFoot
-    bot.ragdollNodes = [
-      mk('torso', bx, 0.9 - crouchY, bz, imp.x * 0.6, imp.y * 0.3, imp.z * 0.6),
-      mk(
-        'torso',
-        bx,
-        1.32 - crouchY,
-        bz,
-        imp.x * 1.1 + staggerX,
-        imp.y * 0.5,
-        imp.z * 1.1 + staggerZ,
-      ),
-      mk(
-        'head',
-        bx,
-        1.62 - crouchY,
-        bz,
-        imp.x * 1.35 + staggerX * 1.4,
-        imp.y * 0.7,
-        imp.z * 1.35 + staggerZ * 1.4,
-      ),
-      mk(
-        'leftArm',
-        bx - rightX * 0.34,
-        0.82 - crouchY * 0.5,
-        bz - rightZ * 0.34,
-        imp.x * 0.5 + rightX * 0.02,
-        0,
-        imp.z * 0.5 + rightZ * 0.02,
-      ),
-      mk(
-        'rightArm',
-        bx + rightX * 0.34,
-        0.82 - crouchY * 0.5,
-        bz + rightZ * 0.34,
-        imp.x * 0.5 - rightX * 0.02,
-        0,
-        imp.z * 0.5 - rightZ * 0.02,
-      ),
-      mk(
-        'leftLeg',
-        bx - rightX * 0.14,
-        0.08,
-        bz - rightZ * 0.14,
-        0,
-        0,
-        0,
-      ),
-      mk(
-        'rightLeg',
-        bx + rightX * 0.14,
-        0.08,
-        bz + rightZ * 0.14,
-        0,
-        0,
-        0,
-      ),
-    ];
+    bot.ragdoll = createRagdollState(bot.pos, bot.yaw, bot.crouchFactor, impulse);
   }
 
   private resetRigToStanding(bot: BotEntity) {
-    bot.ragdollNodes = null;
+    bot.ragdoll = null;
     bot.rig.contactShadow.visible = true;
     bot.rig.root.position.copy(bot.pos);
     bot.rig.root.rotation.set(0, bot.yaw, 0);
-    bot.rig.limbs.torso.position.set(0, 1.12, 0);
-    bot.rig.limbs.torso.quaternion.identity();
-    bot.rig.limbs.head.position.set(0, 1.48, 0);
-    bot.rig.limbs.head.quaternion.identity();
-    bot.rig.limbs.leftArm.position.set(-0.27, 1.36, 0);
-    bot.rig.limbs.leftArm.quaternion.identity();
-    bot.rig.limbs.rightArm.position.set(0.27, 1.36, 0);
-    bot.rig.limbs.rightArm.quaternion.identity();
-    bot.rig.limbs.leftLeg.position.set(-0.115, 0.85, 0);
-    bot.rig.limbs.leftLeg.quaternion.identity();
-    bot.rig.limbs.rightLeg.position.set(0.115, 0.85, 0);
-    bot.rig.limbs.rightLeg.quaternion.identity();
+    resetGoreDollPose(bot.rig);
   }
 
-  private stepRagdoll(bot: BotEntity, dt: number) {
-    const nodes = bot.ragdollNodes;
-    if (!nodes || nodes.length < 7) return;
+  private stepRagdoll(bot: BotEntity, dt: number, pinPelvis?: THREE.Vector3) {
+    if (!bot.ragdoll) return;
+    stepArticulatedRagdoll(
+      bot.ragdoll,
+      bot.rig,
+      bot.pos,
+      this.colliders,
+      resolveRagdollNodeCollisions,
+      dt,
+      pinPelvis,
+    );
+  }
 
-    const grav = 16.5 * dt * dt;
-    for (let i = 0; i < 7; i++) {
-      const n = nodes[i];
-      const groundR = i <= 2 ? 0.12 : 0.06;
-      const onGround = n.pos.y <= groundR + 0.025;
-      const damp = onGround ? 0.84 : 0.975;
-      const vx = (n.pos.x - n.prevPos.x) * damp;
-      const vy = (n.pos.y - n.prevPos.y) * damp;
-      const vz = (n.pos.z - n.prevPos.z) * damp;
-      n.prevPos.copy(n.pos);
-      n.pos.x += vx;
-      n.pos.y += vy - grav;
-      n.pos.z += vz;
-    }
-
-    const solveDist = (
-      aIdx: number,
-      bIdx: number,
-      targetDist: number,
-      minOnly = false,
-    ) => {
-      const a = nodes[aIdx].pos;
-      const b = nodes[bIdx].pos;
-      _rdDir.subVectors(b, a);
-      const len = _rdDir.length();
-      if (len < 1e-5) return;
-      if (minOnly && len >= targetDist) return;
-      const diff = (len - targetDist) / len;
-      _rdDir.multiplyScalar(diff * 0.5);
-      a.add(_rdDir);
-      b.sub(_rdDir);
-    };
-
-    for (let iter = 0; iter < 4; iter++) {
-      // Exact skeleton bone lengths
-      solveDist(0, 1, 0.42); // pelvis -> chest
-      solveDist(1, 2, 0.30); // chest -> head
-      solveDist(1, 3, 0.58); // chest -> leftHand
-      solveDist(1, 4, 0.58); // chest -> rightHand
-      solveDist(0, 5, 0.82); // pelvis -> leftFoot
-      solveDist(0, 6, 0.82); // pelvis -> rightFoot
-
-      // Soft anti-collapse minimum distances so limbs never telescope inside torso
-      solveDist(0, 2, 0.68, true); // pelvis - head min
-      solveDist(3, 4, 0.32, true); // hands apart
-      solveDist(5, 6, 0.22, true); // feet apart
-      solveDist(0, 3, 0.34, true);
-      solveDist(0, 4, 0.34, true);
-
-      for (let i = 0; i < 7; i++) {
-        const groundR = i <= 2 ? 0.12 : 0.06;
-        resolveRagdollNodeCollisions(nodes[i].pos, groundR, this.colliders);
-      }
-    }
-
-    const pelvis = nodes[0].pos;
-    const chest = nodes[1].pos;
-    const head = nodes[2].pos;
-    const leftHand = nodes[3].pos;
-    const rightHand = nodes[4].pos;
-    const leftFoot = nodes[5].pos;
-    const rightFoot = nodes[6].pos;
-
-    bot.pos.set(pelvis.x, 0, pelvis.z);
-
-    // Put root at world origin so every articulated limb aligns directly in world space
-    bot.rig.root.position.set(0, 0, 0);
-    bot.rig.root.rotation.set(0, 0, 0);
-
-    // Torso orthonormal basis
-    _rdY.subVectors(chest, pelvis);
-    if (_rdY.lengthSq() < 1e-5) _rdY.set(0, 1, 0);
-    else _rdY.normalize();
-
-    _rdX.subVectors(rightHand, leftHand);
-    _rdX.addScaledVector(_rdY, -_rdX.dot(_rdY));
-    if (_rdX.lengthSq() < 0.02) {
-      _rdX.set(Math.cos(bot.yaw), 0, -Math.sin(bot.yaw));
-      _rdX.addScaledVector(_rdY, -_rdX.dot(_rdY));
-    }
-    if (_rdX.lengthSq() < 1e-5) _rdX.set(1, 0, 0);
-    else _rdX.normalize();
-
-    _rdZ.crossVectors(_rdX, _rdY).normalize();
-    _rdX.crossVectors(_rdY, _rdZ).normalize();
-    _rdMat.makeBasis(_rdX, _rdY, _rdZ);
-
-    bot.rig.limbs.torso.position.lerpVectors(pelvis, chest, 0.5);
-    bot.rig.limbs.torso.quaternion.setFromRotationMatrix(_rdMat);
-
-    // Head aligned from chest -> head
-    _rdDir.subVectors(head, chest);
-    if (_rdDir.lengthSq() < 1e-5) _rdDir.copy(_rdY);
-    else _rdDir.normalize();
-    bot.rig.limbs.head.position.copy(chest).addScaledVector(_rdDir, 0.14);
-    bot.rig.limbs.head.quaternion.setFromUnitVectors(_upY, _rdDir);
-
-    // Left Arm (hangs along local -Y, so local +Y points from hand -> shoulder)
-    _rdShoulderL.copy(chest).addScaledVector(_rdX, -0.25).addScaledVector(_rdY, 0.08);
-    _rdDir.subVectors(_rdShoulderL, leftHand);
-    if (_rdDir.lengthSq() < 1e-5) _rdDir.copy(_rdY);
-    else _rdDir.normalize();
-    bot.rig.limbs.leftArm.position.copy(_rdShoulderL);
-    bot.rig.limbs.leftArm.quaternion.setFromUnitVectors(_upY, _rdDir);
-
-    // Right Arm
-    _rdShoulderR.copy(chest).addScaledVector(_rdX, 0.25).addScaledVector(_rdY, 0.08);
-    _rdDir.subVectors(_rdShoulderR, rightHand);
-    if (_rdDir.lengthSq() < 1e-5) _rdDir.copy(_rdY);
-    else _rdDir.normalize();
-    bot.rig.limbs.rightArm.position.copy(_rdShoulderR);
-    bot.rig.limbs.rightArm.quaternion.setFromUnitVectors(_upY, _rdDir);
-
-    // Left Leg (hangs along local -Y, so local +Y points from foot -> hip)
-    _rdHipL.copy(pelvis).addScaledVector(_rdX, -0.115);
-    _rdDir.subVectors(_rdHipL, leftFoot);
-    if (_rdDir.lengthSq() < 1e-5) _rdDir.copy(_rdY);
-    else _rdDir.normalize();
-    bot.rig.limbs.leftLeg.position.copy(_rdHipL);
-    bot.rig.limbs.leftLeg.quaternion.setFromUnitVectors(_upY, _rdDir);
-
-    // Right Leg
-    _rdHipR.copy(pelvis).addScaledVector(_rdX, 0.115);
-    _rdDir.subVectors(_rdHipR, rightFoot);
-    if (_rdDir.lengthSq() < 1e-5) _rdDir.copy(_rdY);
-    else _rdDir.normalize();
-    bot.rig.limbs.rightLeg.position.copy(_rdHipR);
-    bot.rig.limbs.rightLeg.quaternion.setFromUnitVectors(_upY, _rdDir);
+  stepGrabbedRagdoll(bot: BotEntity, pinPos: THREE.Vector3, dt: number) {
+    if (!bot.ragdoll) return;
+    wakeRagdoll(bot.ragdoll);
+    this.stepRagdoll(bot, dt, pinPos);
   }
 
   private dropBotUnconscious(bot: BotEntity) {
     if (bot.aiState === 'dead' || bot.aiState === 'unconscious') return;
     bot.aiState = 'unconscious';
     bot.lootDropped = true;
+    bot.rig.contactShadow.visible = false;
     this.initRagdollNodes(bot);
     bot.rig.root.traverse((c) => {
       c.userData.lootId = bot.loot.id;
@@ -994,16 +789,25 @@ export class BotManager {
   }
 
   killBot(bot: BotEntity, impulse?: THREE.Vector3) {
-    if (bot.aiState === 'dead') return;
+    if (bot.aiState === 'dead') {
+      if (bot.ragdoll && impulse) {
+        wakeRagdoll(bot.ragdoll);
+        const imp = impulse.clone().clampLength(0, 8).multiplyScalar(0.025);
+        bot.ragdoll.nodes[1].prevPos.sub(imp);
+        bot.ragdoll.nodes[2].prevPos.sub(imp);
+      }
+      return;
+    }
     bot.aiState = 'dead';
     bot.phys.consciousness = 'dead';
     bot.rig.contactShadow.visible = false;
-    if (!bot.ragdollNodes) {
+    if (!bot.ragdoll) {
       this.initRagdollNodes(bot, impulse);
     } else if (impulse) {
-      const imp = impulse.clone().clampLength(0, 8).multiplyScalar(0.03);
-      bot.ragdollNodes[1].prevPos.sub(imp);
-      bot.ragdollNodes[2].prevPos.sub(imp);
+      wakeRagdoll(bot.ragdoll);
+      const imp = impulse.clone().clampLength(0, 8).multiplyScalar(0.025);
+      bot.ragdoll.nodes[1].prevPos.sub(imp);
+      bot.ragdoll.nodes[2].prevPos.sub(imp);
     }
     bot.lootDropped = true;
     bot.rig.root.traverse((c) => {
@@ -1304,6 +1108,7 @@ export class BotManager {
 
     if (def.kind === 'melee') {
       bot.fireCooldown = 0.85;
+      bot.recoilPulse = 1.0;
       soundEngine.playMeleeSwing(false);
       if (targetIsPlayer) {
         const limbs: LimbId[] = ['torso', 'leftArm', 'rightArm', 'leftLeg'];
@@ -1352,6 +1157,7 @@ export class BotManager {
     }
 
     bot.ammoInMag -= 1;
+    bot.recoilPulse = 1.0;
     bot.fireCooldown =
       def.id === 'rifle_556'
         ? 0.22 + (bot.ammoInMag % 3 === 0 ? 0.45 : 0)
@@ -1477,7 +1283,7 @@ export class BotManager {
 
       if (bot.aiState === 'dead') {
         bot.speechText = null;
-        if (bot.ragdollNodes && !bot.grabbedByCrusher) {
+        if (bot.ragdoll && !bot.grabbedByCrusher) {
           this.stepRagdoll(bot, dt);
         }
         continue;
@@ -1496,7 +1302,7 @@ export class BotManager {
       ) {
         bot.speechText = null;
         this.dropBotUnconscious(bot);
-        if (bot.ragdollNodes && !bot.grabbedByCrusher) {
+        if (bot.ragdoll && !bot.grabbedByCrusher) {
           this.stepRagdoll(bot, dt);
         }
         continue;
@@ -1704,8 +1510,6 @@ export class BotManager {
 
       if (bot.aiState === 'surrender') {
         moveSpeed = 0;
-        bot.rig.limbs.leftArm.rotation.x = -2.6;
-        bot.rig.limbs.rightArm.rotation.x = -2.6;
       } else if (bot.aiState === 'heal') {
         wantCrouch = true;
         if (bot.coverPos && bot.pos.distanceTo(bot.coverPos) > 1.6) {
@@ -2040,41 +1844,45 @@ export class BotManager {
         bot.vel.multiplyScalar(Math.max(0, 1 - dt * 7));
       }
 
-      // Smooth human-like turning & crouch posture interpolation
+      // Smooth human-like turning, crouch posture, & full 11-joint procedural body animation
       bot.yaw = lerpAngleStep(bot.yaw, bot.targetYaw, dt * 7.5);
       bot.crouchFactor = THREE.MathUtils.damp(bot.crouchFactor, wantCrouch ? 1 : 0, 10, dt);
-
-      const speedFactor = moving ? Math.min(1.2, moveSpeed / 2.8) : 0;
-      const stride =
-        Math.sin(timeElapsed * (bot.aiState === 'crawl' ? 6 : 9.2)) * 0.45 * speedFactor;
+      bot.recoilPulse = THREE.MathUtils.damp(bot.recoilPulse, 0, 16, dt);
+      bot.flinchPitch = THREE.MathUtils.damp(bot.flinchPitch, 0, 13, dt);
+      bot.flinchRoll = THREE.MathUtils.damp(bot.flinchRoll, 0, 13, dt);
 
       bot.rig.root.position.copy(bot.pos);
-      bot.rig.root.position.y =
-        bot.aiState === 'crawl' ? 0.25 : -0.26 * bot.crouchFactor;
-      bot.rig.root.rotation.set(bot.aiState === 'crawl' ? 1.15 : 0, bot.yaw, 0);
+      bot.rig.root.rotation.set(0, bot.yaw, 0);
 
-      if (bot.aiState !== 'surrender') {
-        bot.rig.limbs.leftLeg.rotation.x = stride + bot.crouchFactor * 0.42;
-        bot.rig.limbs.rightLeg.rotation.x = -stride + bot.crouchFactor * 0.42;
+      const totalPainOrBloodLoss =
+        Math.max(0, 1 - bot.phys.bloodVolumeMl / 5000) * 0.8 +
+        Math.min(1, bot.phys.pain / 100) * 0.5;
+      const twoHanded =
+        bot.weapon === 'rifle_556' ||
+        bot.weapon === 'shotgun_12ga' ||
+        bot.weapon === 'sniper_762';
 
-        if (bot.aiState === 'heal') {
-          const wrapWave = Math.sin(timeElapsed * 10) * 0.28;
-          bot.rig.limbs.leftArm.rotation.x = -1.1 + wrapWave;
-          bot.rig.limbs.rightArm.rotation.x = -1.1 - wrapWave;
-        } else if (bot.aiState === 'reload') {
-          bot.rig.limbs.leftArm.rotation.x = -0.9;
-          bot.rig.limbs.rightArm.rotation.x = -0.65;
-        } else {
-          bot.rig.limbs.leftArm.rotation.x = -stride * 0.6;
-          bot.rig.limbs.rightArm.rotation.x =
-            bot.aiState === 'engage' ||
-            bot.aiState === 'warn' ||
-            bot.aiState === 'takeCover' ||
-            combatTargetBot
-              ? -1.35
-              : stride * 0.6;
-        }
-      }
+      stepProceduralCharacterAnim(bot.rig, bot.animState, {
+        dt,
+        moveSpeed: moving ? moveSpeed : bot.vel.length(),
+        crouchFactor: bot.crouchFactor,
+        aiming:
+          bot.aiState === 'engage' ||
+          bot.aiState === 'warn' ||
+          bot.aiState === 'takeCover' ||
+          Boolean(combatTargetBot),
+        crawling: bot.aiState === 'crawl',
+        surrendering: bot.aiState === 'surrender',
+        healing: bot.aiState === 'heal',
+        reloading: bot.aiState === 'reload',
+        woundedFrac: Math.min(1, totalPainOrBloodLoss),
+        legInjured: legBroken,
+        recoilPulse: bot.recoilPulse,
+        flinchPitch: bot.flinchPitch,
+        flinchRoll: bot.flinchRoll,
+        twoHandedWeapon: twoHanded,
+        infected: bot.archetype === 'infected',
+      });
     }
   }
 }

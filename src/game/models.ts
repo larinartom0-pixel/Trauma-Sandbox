@@ -1,9 +1,24 @@
 import * as THREE from 'three';
 import { BotArchetype, GestureId, LimbId, WeaponId } from './types';
 
+export interface GoreDollJoints {
+  hips: THREE.Group;
+  spine: THREE.Group;
+  head: THREE.Group;
+  leftArm: THREE.Group;
+  leftElbow: THREE.Group;
+  rightArm: THREE.Group;
+  rightElbow: THREE.Group;
+  leftLeg: THREE.Group;
+  leftKnee: THREE.Group;
+  rightLeg: THREE.Group;
+  rightKnee: THREE.Group;
+}
+
 export interface GoreDollRig {
   root: THREE.Group;
   limbs: Record<LimbId, THREE.Group>;
+  joints: GoreDollJoints;
   limbMeshes: Record<LimbId, THREE.Mesh[]>;
   weaponMount: THREE.Group;
   contactShadow: THREE.Mesh;
@@ -25,6 +40,7 @@ function tagLimb(group: THREE.Object3D, botId: string, limbId: LimbId): THREE.Me
   group.traverse((child) => {
     if ((child as THREE.Mesh).isMesh) {
       const m = child as THREE.Mesh;
+      if (m.userData.limbId) return;
       m.userData.botId = botId;
       m.userData.limbId = limbId;
       m.castShadow = true;
@@ -36,8 +52,8 @@ function tagLimb(group: THREE.Object3D, botId: string, limbId: LimbId): THREE.Me
 }
 
 /**
- * Builds a high-detail articulated GoreDoll using capsules, cylinders, beveled armor rigs,
- * pouches, boots, and natural headgear — with NO floating good/bad color spoilers.
+ * Builds an articulated hierarchical GoreDoll skeleton (hips -> spine -> chest/head/shoulders->elbows
+ * and hips -> thighs->knees->boots) with NO floating good/bad color spoilers.
  */
 export function createGoreDollModel(
   botId: string,
@@ -92,72 +108,81 @@ export function createGoreDollModel(
   contactShadow.position.y = 0.02;
   root.add(contactShadow);
 
-  // Torso (anatomical chest taper + plate carrier + 3 mag pouches + belt + backpack)
-  const torso = new THREE.Group();
-  torso.position.set(0, 1.12, 0);
-
-  const upperChest = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.22, 0.18, 0.46, 12),
-    coatMat.clone(),
-  );
-  upperChest.scale.set(1.08, 1, 0.7);
-  upperChest.position.y = 0.08;
-
-  const shoulders = new THREE.Mesh(
-    new THREE.CapsuleGeometry(0.11, 0.32, 6, 10),
-    coatMat.clone(),
-  );
-  shoulders.rotation.z = Math.PI / 2;
-  shoulders.position.y = 0.24;
-
-  const vestPlate = new THREE.Mesh(
-    new THREE.BoxGeometry(0.36, 0.34, 0.26),
-    gearMat,
-  );
-  vestPlate.position.y = 0.07;
-
-  // Tactical mag pouches
-  for (let i = -1; i <= 1; i++) {
-    const pouch = new THREE.Mesh(
-      new THREE.BoxGeometry(0.085, 0.12, 0.05),
-      leatherMat,
-    );
-    pouch.position.set(i * 0.1, -0.02, 0.15);
-    torso.add(pouch);
-  }
-
-  const backpack = new THREE.Mesh(
-    new THREE.BoxGeometry(0.28, 0.34, 0.14),
-    leatherMat,
-  );
-  backpack.position.set(0, 0.06, -0.18);
+  // Hips / Pelvis Root Joint (center of mass at y = 0.90)
+  const hips = new THREE.Group();
+  hips.position.set(0, 0.9, 0);
 
   const pelvis = new THREE.Mesh(
     new THREE.CylinderGeometry(0.175, 0.16, 0.2, 12),
     pantsMat.clone(),
   );
   pelvis.scale.set(1.06, 1, 0.72);
-  pelvis.position.y = -0.22;
+  pelvis.position.y = 0;
 
   const belt = new THREE.Mesh(
     new THREE.CylinderGeometry(0.185, 0.185, 0.055, 12),
     leatherMat,
   );
   belt.scale.set(1.06, 1, 0.74);
-  belt.position.y = -0.13;
+  belt.position.y = 0.09;
 
-  torso.add(upperChest, shoulders, vestPlate, backpack, pelvis, belt);
-  root.add(torso);
+  hips.add(pelvis, belt);
 
-  // Head (sculpted neck + cranium sphere + jaw + nose + eyes + varied headgear)
+  // Spine / Waist Joint (child of hips at y = +0.11 -> world 1.01)
+  const spine = new THREE.Group();
+  spine.position.set(0, 0.11, 0);
+
+  const upperChest = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.22, 0.18, 0.46, 12),
+    coatMat.clone(),
+  );
+  upperChest.scale.set(1.08, 1, 0.7);
+  upperChest.position.y = 0.19;
+
+  const shoulders = new THREE.Mesh(
+    new THREE.CapsuleGeometry(0.11, 0.32, 6, 10),
+    coatMat.clone(),
+  );
+  shoulders.rotation.z = Math.PI / 2;
+  shoulders.position.y = 0.35;
+
+  const vestPlate = new THREE.Mesh(
+    new THREE.BoxGeometry(0.36, 0.34, 0.26),
+    gearMat,
+  );
+  vestPlate.position.y = 0.18;
+
+  for (let i = -1; i <= 1; i++) {
+    const pouch = new THREE.Mesh(
+      new THREE.BoxGeometry(0.085, 0.12, 0.05),
+      leatherMat,
+    );
+    pouch.position.set(i * 0.1, 0.09, 0.15);
+    spine.add(pouch);
+  }
+
+  const backpack = new THREE.Mesh(
+    new THREE.BoxGeometry(0.28, 0.34, 0.14),
+    leatherMat,
+  );
+  backpack.position.set(0, 0.17, -0.18);
+
+  spine.add(upperChest, shoulders, vestPlate, backpack);
+  hips.add(spine);
+  root.add(hips);
+
+  // Tag torso meshes BEFORE attaching head, arms, and legs
+  const torsoMeshes = tagLimb(hips, botId, 'torso');
+
+  // Head Joint (child of spine at y = +0.47 -> world 1.48)
   const head = new THREE.Group();
-  head.position.set(0, 1.48, 0);
+  head.position.set(0, 0.47, 0);
 
   const neck = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.065, 0.078, 0.12, 10),
+    new THREE.CylinderGeometry(0.065, 0.078, 0.14, 10),
     skinMat.clone(),
   );
-  neck.position.y = 0.02;
+  neck.position.y = 0.01;
 
   const cranium = new THREE.Mesh(
     new THREE.SphereGeometry(0.128, 14, 12),
@@ -217,12 +242,12 @@ export function createGoreDollModel(
     brim.position.set(0, 0.21, 0.12);
     head.add(dome, brim);
   }
-  root.add(head);
+  spine.add(head);
 
-  // Articulated Capsule Arms
+  // Articulated 2-Segment Arms (Shoulder -> Elbow -> Forearm + Glove)
   const buildArm = (side: -1 | 1) => {
-    const g = new THREE.Group();
-    g.position.set(side * 0.27, 1.36, 0);
+    const shoulder = new THREE.Group();
+    shoulder.position.set(side * 0.27, 0.35, 0);
 
     const shoulderPad = new THREE.Mesh(
       new THREE.SphereGeometry(0.075, 10, 8),
@@ -234,38 +259,47 @@ export function createGoreDollModel(
     );
     upperArm.position.y = -0.14;
 
-    const elbow = new THREE.Mesh(
+    const elbowCap = new THREE.Mesh(
       new THREE.SphereGeometry(0.054, 8, 8),
       gearMat,
     );
-    elbow.position.y = -0.28;
+    elbowCap.position.y = -0.28;
+
+    const elbow = new THREE.Group();
+    elbow.position.set(0, -0.28, 0);
 
     const forearm = new THREE.Mesh(
       new THREE.CapsuleGeometry(0.048, 0.2, 6, 10),
       skinMat.clone(),
     );
-    forearm.position.y = -0.41;
+    forearm.position.y = -0.13;
 
     const glove = new THREE.Mesh(
       new THREE.BoxGeometry(0.085, 0.095, 0.095),
       leatherMat,
     );
-    glove.position.y = -0.56;
+    glove.position.y = -0.28;
 
-    g.add(shoulderPad, upperArm, elbow, forearm, glove);
-    return g;
+    elbow.add(forearm, glove);
+    shoulder.add(shoulderPad, upperArm, elbowCap, elbow);
+    return { shoulder, elbow };
   };
-  const leftArm = buildArm(-1);
-  const rightArm = buildArm(1);
-  const weaponMount = new THREE.Group();
-  weaponMount.position.set(0, -0.57, 0.12);
-  rightArm.add(weaponMount);
-  root.add(leftArm, rightArm);
+  const leftArmBuilt = buildArm(-1);
+  const rightArmBuilt = buildArm(1);
+  const leftArm = leftArmBuilt.shoulder;
+  const leftElbow = leftArmBuilt.elbow;
+  const rightArm = rightArmBuilt.shoulder;
+  const rightElbow = rightArmBuilt.elbow;
 
-  // Articulated Capsule Legs + Combat Boots
+  const weaponMount = new THREE.Group();
+  weaponMount.position.set(0, -0.29, 0.12);
+  rightElbow.add(weaponMount);
+  spine.add(leftArm, rightArm);
+
+  // Articulated 2-Segment Legs (Hip -> Knee -> Shin + Boot)
   const buildLeg = (side: -1 | 1) => {
-    const g = new THREE.Group();
-    g.position.set(side * 0.115, 0.85, 0);
+    const hip = new THREE.Group();
+    hip.position.set(side * 0.115, -0.05, 0);
 
     const thigh = new THREE.Mesh(
       new THREE.CapsuleGeometry(0.078, 0.26, 6, 10),
@@ -279,34 +313,42 @@ export function createGoreDollModel(
     );
     kneePad.position.set(0, -0.37, 0.02);
 
+    const knee = new THREE.Group();
+    knee.position.set(0, -0.38, 0);
+
     const shin = new THREE.Mesh(
       new THREE.CapsuleGeometry(0.064, 0.25, 6, 10),
       pantsMat.clone(),
     );
-    shin.position.y = -0.54;
+    shin.position.y = -0.16;
 
     const bootAnkle = new THREE.Mesh(
       new THREE.CylinderGeometry(0.068, 0.072, 0.14, 10),
       leatherMat,
     );
-    bootAnkle.position.y = -0.73;
+    bootAnkle.position.y = -0.35;
 
     const bootSole = new THREE.Mesh(
       new THREE.BoxGeometry(0.13, 0.075, 0.25),
       leatherMat,
     );
-    bootSole.position.set(0, -0.81, 0.045);
+    bootSole.position.set(0, -0.43, 0.045);
 
-    g.add(thigh, kneePad, shin, bootAnkle, bootSole);
-    return g;
+    knee.add(shin, bootAnkle, bootSole);
+    hip.add(thigh, kneePad, knee);
+    return { hip, knee };
   };
-  const leftLeg = buildLeg(-1);
-  const rightLeg = buildLeg(1);
-  root.add(leftLeg, rightLeg);
+  const leftLegBuilt = buildLeg(-1);
+  const rightLegBuilt = buildLeg(1);
+  const leftLeg = leftLegBuilt.hip;
+  const leftKnee = leftLegBuilt.knee;
+  const rightLeg = rightLegBuilt.hip;
+  const rightKnee = rightLegBuilt.knee;
+  hips.add(leftLeg, rightLeg);
 
   const limbMeshes: Record<LimbId, THREE.Mesh[]> = {
     head: tagLimb(head, botId, 'head'),
-    torso: tagLimb(torso, botId, 'torso'),
+    torso: torsoMeshes,
     leftArm: tagLimb(leftArm, botId, 'leftArm'),
     rightArm: tagLimb(rightArm, botId, 'rightArm'),
     leftLeg: tagLimb(leftLeg, botId, 'leftLeg'),
@@ -315,7 +357,20 @@ export function createGoreDollModel(
 
   return {
     root,
-    limbs: { head, torso, leftArm, rightArm, leftLeg, rightLeg },
+    limbs: { head, torso: spine, leftArm, rightArm, leftLeg, rightLeg },
+    joints: {
+      hips,
+      spine,
+      head,
+      leftArm,
+      leftElbow,
+      rightArm,
+      rightElbow,
+      leftLeg,
+      leftKnee,
+      rightLeg,
+      rightKnee,
+    },
     limbMeshes,
     weaponMount,
     contactShadow,
