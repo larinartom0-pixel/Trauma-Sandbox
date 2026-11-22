@@ -3,12 +3,16 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { BotEntity, BotManager } from './ai';
 import {
   createProceduralAnimState,
+  createRagdollState,
   ProceduralAnimState,
+  RagdollState,
+  resetGoreDollPose,
   shiftRagdoll,
+  stepArticulatedRagdoll,
   stepProceduralCharacterAnim,
 } from './animation';
 import { soundEngine } from './audio';
-import { BACKPACK_TIERS, detectTouchMode, WEAPON_DEFS } from './data';
+import { BACKPACK_TIERS, detectTouchMode, GESTURE_DEFS, WEAPON_DEFS } from './data';
 import {
   addItemToGrid,
   buildGridFromLoot,
@@ -32,6 +36,11 @@ import {
   poseGestureHand,
 } from './models';
 import {
+  FastPacket,
+  P2PNetworkManager,
+  ReliablePacket,
+} from './network';
+import {
   applyBandageStroke,
   applyLimbSplint,
   applyLimbTrauma,
@@ -48,8 +57,10 @@ import {
 import { createProceduralTextures, ProceduralTexturePack } from './textures';
 import {
   BackpackTierId,
+  BotArchetype,
   CaliberId,
   CameraMode,
+  ConsciousnessState,
   ControlMode,
   FeedMessage,
   GamePhase,
@@ -61,6 +72,7 @@ import {
   MedItemId,
   NearbyPrompt,
   OverheadSpeechBubble,
+  P2PRoomInfo,
   PhysiologyState,
   WeaponId,
 } from './types';
@@ -102,6 +114,74 @@ interface PhantomEntity {
   firedFakeShot: boolean;
   speechText: string | null;
   speechTimer: number;
+}
+
+interface RemotePlayerEntity {
+  id: string;
+  name: string;
+  archetype: BotArchetype;
+  rig: GoreDollRig;
+  animState: ProceduralAnimState;
+  ragdoll: RagdollState | null;
+  hitMeshes: THREE.Mesh[];
+  pos: THREE.Vector3;
+  targetPos: THREE.Vector3;
+  vel: THREE.Vector3;
+  yaw: number;
+  targetYaw: number;
+  weapon: WeaponId;
+  crouchFactor: number;
+  aiming: boolean;
+  reloading: boolean;
+  flashlightOn: boolean;
+  bloodPct: number;
+  consciousness: ConsciousnessState;
+  legBroken: boolean;
+  woundedFrac: number;
+  recoilPulse: number;
+  flinchPitch: number;
+  flinchRoll: number;
+  chatText: string | null;
+  chatTimer: number;
+}
+
+function resolveRemoteRagdollCollider(
+  pos: THREE.Vector3,
+  radius: number,
+  colliders: TownWorld['colliders'],
+) {
+  if (pos.y < radius) pos.y = radius;
+  for (const c of colliders) {
+    if (pos.y - radius > c.maxY || pos.y + radius < c.minY) continue;
+    if (
+      pos.x + radius > c.minX &&
+      pos.x - radius < c.maxX &&
+      pos.z + radius > c.minZ &&
+      pos.z - radius < c.maxZ
+    ) {
+      const cx = Math.max(c.minX, Math.min(pos.x, c.maxX));
+      const cz = Math.max(c.minZ, Math.min(pos.z, c.maxZ));
+      const dx = pos.x - cx;
+      const dz = pos.z - cz;
+      const dSq = dx * dx + dz * dz;
+      if (dSq > 1e-6) {
+        const d = Math.sqrt(dSq);
+        const push = radius - d;
+        pos.x += (dx / d) * push;
+        pos.z += (dz / d) * push;
+      } else {
+        pos.y = Math.max(pos.y, c.maxY + radius);
+      }
+    }
+  }
+  pos.x = Math.max(-WORLD_BOUND, Math.min(WORLD_BOUND, pos.x));
+  pos.z = Math.max(-WORLD_BOUND, Math.min(WORLD_BOUND, pos.z));
+}
+
+function lerpAngleDelta(current: number, target: number, alpha: number): number {
+  let diff = ((target - current + Math.PI) % (Math.PI * 2)) - Math.PI;
+  if (diff < -Math.PI) diff += Math.PI * 2;
+  return current + diff * alpha;
 }
 
 interface ThrownGrenade {
@@ -237,6 +317,13 @@ export class TraumaSandboxEngine {
   private conscWarnStage: 0 | 1 | 2 = 0;
   private hallucinationFxTimer = 6;
 
+  // WebRTC P2P Multiplayer
+  private network!: P2PNetworkManager;
+  private remotePlayers = new Map<string, RemotePlayerEntity>();
+  private remoteHitMeshes: THREE.Mesh[] = [];
+  private netFastTimer = 0;
+  private netBotTimer = 0;
+
   constructor(
     container: HTMLElement,
     onSnapshot: (snap: GameSnapshot) => void,
@@ -361,6 +448,35 @@ export class TraumaSandboxEngine {
     );
     this.crusherBeam.visible = false;
     this.scene.add(this.crusherBeam);
+
+    this.network = new P2PNetworkManager(
+      {
+        onStateChange: () => {
+          this.pushSnapshot(true);
+        },
+        onPeerJoin: (peerId, name, archetype) => {
+          this.ensureRemotePlayer(peerId, name, archetype);
+          this.pushFeed(`${name} приєднався до кімнати`, 'friendly');
+        },
+        onPeerLeave: (peerId, name) => {
+          this.removeRemotePlayer(peerId);
+          if (name !== peerId) {
+            this.pushFeed(`${name} вийшов з кімнати`, 'warn');
+          }
+        },
+        onFastPacket: (peerId, pkt) => this.handleFastPacket(peerId, pkt),
+        onReliablePacket: (peerId, pkt) => this.handleReliablePacket(peerId, pkt),
+        onHostChanged: (_newHostId, amIHost) => {
+          if (amIHost) {
+            this.pushFeed('Ви стали новим хостом кімнати!', 'friendly');
+            if (this.network.botsEnabled) {
+              this.botManager.respawnTownBotsIfEmpty();
+            }
+          }
+        },
+      },
+      () => this.timeOfDay,
+    );
 
     this.initWorldAndPlayer();
     this.bindEvents();
@@ -559,11 +675,422 @@ export class TraumaSandboxEngine {
     this.phantomFlashLight.intensity = 0;
 
     this.initWorldAndPlayer();
+    if (this.network.connected) {
+      for (const rp of this.remotePlayers.values()) {
+        this.scene.add(rp.rig.root);
+      }
+      if (!this.network.botsEnabled || !this.network.isHost) {
+        this.botManager.clearAllBots();
+      }
+    }
     this.phase = 'playing';
     if (!this.isTouchPrimary()) {
       this.requestPointerLock();
     }
     this.pushSnapshot(true);
+  }
+
+  // --- P2P Multiplayer Public & Sync API ---
+
+  async checkP2PServerStatus() {
+    return this.network.checkServerStatus();
+  }
+
+  async fetchP2PRooms(): Promise<P2PRoomInfo[]> {
+    return this.network.fetchRooms();
+  }
+
+  getSavedPlayerName(): string {
+    return this.network.playerName;
+  }
+
+  async createP2PRoom(opts: {
+    roomName: string;
+    playerName: string;
+    maxPlayers: number;
+    friendlyFire: boolean;
+    botsEnabled: boolean;
+  }): Promise<{ ok: boolean; error?: string; roomId?: string }> {
+    const res = await this.network.createRoom(opts);
+    if (!res.ok) return res;
+    this.clearRemotePlayers();
+    this.resetPlayerState();
+    this.playerPos.set((Math.random() - 0.5) * 8, 0, -4 + (Math.random() - 0.5) * 6);
+    if (!opts.botsEnabled) {
+      this.botManager.clearAllBots();
+    } else {
+      this.botManager.respawnTownBotsIfEmpty();
+    }
+    this.phase = 'playing';
+    if (!this.isTouchPrimary()) {
+      this.requestPointerLock();
+    }
+    this.pushFeed(`Кімнату "${opts.roomName}" створено (ID: ${res.roomId})`, 'friendly');
+    this.pushSnapshot(true);
+    return res;
+  }
+
+  async joinP2PRoom(opts: {
+    roomId: string;
+    playerName: string;
+  }): Promise<{ ok: boolean; error?: string }> {
+    const res = await this.network.joinRoom(opts);
+    if (!res.ok) return { ok: false, error: res.error };
+    this.clearRemotePlayers();
+    this.resetPlayerState();
+    this.playerPos.set((Math.random() - 0.5) * 10, 0, -4 + (Math.random() - 0.5) * 8);
+    if (typeof res.meta?.timeOfDay === 'number') {
+      this.timeOfDay = res.meta.timeOfDay;
+    }
+    // Non-host always clears local bots to sync from Host (or play bot-free)
+    this.botManager.clearAllBots();
+    this.phase = 'playing';
+    if (!this.isTouchPrimary()) {
+      this.requestPointerLock();
+    }
+    this.pushFeed(`Підключено до кімнати "${this.network.roomName}"`, 'friendly');
+    this.pushSnapshot(true);
+    return { ok: true };
+  }
+
+  async leaveP2PRoom() {
+    await this.network.leaveRoom();
+    this.clearRemotePlayers();
+    this.botManager.respawnTownBotsIfEmpty();
+    this.pushFeed('Ви вийшли з мультиплеєрної кімнати.', 'neutral');
+    this.pushSnapshot(true);
+  }
+
+  sendP2PChat(text: string) {
+    this.network.sendChat(text);
+    this.pushSnapshot(true);
+  }
+
+  respawnInMultiplayer() {
+    this.resetPlayerState();
+    this.playerPos.set((Math.random() - 0.5) * 14, 0, (Math.random() - 0.5) * 14);
+    this.phase = 'playing';
+    if (!this.isTouchPrimary()) {
+      this.requestPointerLock();
+    }
+    this.pushFeed('Відродження у кімнаті P2P.', 'friendly');
+    this.pushSnapshot(true);
+  }
+
+  private ensureRemotePlayer(
+    peerId: string,
+    name: string,
+    archetype: BotArchetype,
+  ): RemotePlayerEntity {
+    const existing = this.remotePlayers.get(peerId);
+    if (existing) {
+      existing.name = name;
+      return existing;
+    }
+
+    const rig = createGoreDollModel(peerId, archetype, this.textures.contactShadow);
+    const hitMeshes: THREE.Mesh[] = [];
+    (Object.keys(rig.limbMeshes) as LimbId[]).forEach((lid) => {
+      for (const m of rig.limbMeshes[lid]) {
+        delete m.userData.botId;
+        m.userData.remotePlayerId = peerId;
+        hitMeshes.push(m);
+      }
+    });
+    const initWeapon: WeaponId = 'pistol_9mm';
+    const wMesh = createWeaponMesh(initWeapon);
+    wMesh.scale.setScalar(0.86);
+    rig.weaponMount.add(wMesh);
+
+    const startPos = new THREE.Vector3(0, 0, -2);
+    rig.root.position.copy(startPos);
+    this.scene.add(rig.root);
+
+    const rp: RemotePlayerEntity = {
+      id: peerId,
+      name,
+      archetype,
+      rig,
+      animState: createProceduralAnimState(),
+      ragdoll: null,
+      hitMeshes,
+      pos: startPos.clone(),
+      targetPos: startPos.clone(),
+      vel: new THREE.Vector3(),
+      yaw: 0,
+      targetYaw: 0,
+      weapon: initWeapon,
+      crouchFactor: 0,
+      aiming: false,
+      reloading: false,
+      flashlightOn: false,
+      bloodPct: 100,
+      consciousness: 'awake',
+      legBroken: false,
+      woundedFrac: 0,
+      recoilPulse: 0,
+      flinchPitch: 0,
+      flinchRoll: 0,
+      chatText: null,
+      chatTimer: 0,
+    };
+
+    this.remotePlayers.set(peerId, rp);
+    this.rebuildRemoteHitMeshes();
+    return rp;
+  }
+
+  private removeRemotePlayer(peerId: string) {
+    const rp = this.remotePlayers.get(peerId);
+    if (!rp) return;
+    this.scene.remove(rp.rig.root);
+    this.remotePlayers.delete(peerId);
+    this.rebuildRemoteHitMeshes();
+  }
+
+  private clearRemotePlayers() {
+    for (const rp of this.remotePlayers.values()) {
+      this.scene.remove(rp.rig.root);
+    }
+    this.remotePlayers.clear();
+    this.remoteHitMeshes = [];
+  }
+
+  private rebuildRemoteHitMeshes() {
+    const all: THREE.Mesh[] = [];
+    for (const rp of this.remotePlayers.values()) {
+      all.push(...rp.hitMeshes);
+    }
+    this.remoteHitMeshes = all;
+  }
+
+  private handleFastPacket(peerId: string, pkt: FastPacket) {
+    if (pkt.t === 'p') {
+      const rp =
+        this.remotePlayers.get(peerId) ??
+        this.ensureRemotePlayer(peerId, peerId, 'survivor');
+      rp.targetPos.set(pkt.x, pkt.y, pkt.z);
+      rp.vel.set(pkt.vx, 0, pkt.vz);
+      rp.targetYaw = pkt.yaw + Math.PI;
+      rp.crouchFactor = pkt.c;
+      rp.aiming = pkt.a;
+      rp.reloading = pkt.r;
+      rp.flashlightOn = pkt.f;
+      rp.bloodPct = pkt.b;
+      rp.legBroken = pkt.lB;
+      rp.woundedFrac = pkt.wF;
+
+      if (rp.weapon !== pkt.w) {
+        rp.weapon = pkt.w;
+        rp.rig.weaponMount.clear();
+        if (pkt.w !== 'hands') {
+          const wMesh = createWeaponMesh(pkt.w);
+          wMesh.scale.setScalar(0.86);
+          rp.rig.weaponMount.add(wMesh);
+        }
+      }
+
+      const wasDown =
+        rp.consciousness === 'unconscious' ||
+        rp.consciousness === 'cardiacArrest' ||
+        rp.consciousness === 'dead';
+      const nowDown =
+        pkt.con === 'unconscious' ||
+        pkt.con === 'cardiacArrest' ||
+        pkt.con === 'dead';
+      rp.consciousness = pkt.con;
+
+      if (nowDown && !wasDown) {
+        rp.rig.contactShadow.visible = false;
+        rp.ragdoll = createRagdollState(rp.pos, rp.yaw, rp.crouchFactor);
+      } else if (!nowDown && wasDown) {
+        rp.ragdoll = null;
+        rp.rig.contactShadow.visible = true;
+        rp.rig.root.position.copy(rp.pos);
+        rp.rig.root.rotation.set(0, rp.yaw, 0);
+        resetGoreDollPose(rp.rig);
+      }
+    } else if (pkt.t === 'bots') {
+      if (this.network.connected && !this.network.isHost && this.network.botsEnabled) {
+        if (Math.abs(pkt.tod - this.timeOfDay) > 0.25) {
+          this.timeOfDay = pkt.tod;
+        }
+        this.botManager.applyRemoteBotSnapshot(pkt.list);
+      }
+    }
+  }
+
+  private handleReliablePacket(peerId: string, pkt: ReliablePacket) {
+    const rp = this.remotePlayers.get(peerId);
+    if (pkt.t === 'hello') {
+      const target = this.ensureRemotePlayer(peerId, pkt.name, pkt.archetype);
+      target.name = pkt.name;
+      if (typeof pkt.tod === 'number' && !this.network.isHost) {
+        this.timeOfDay = pkt.tod;
+      }
+    } else if (pkt.t === 'chat') {
+      if (rp) {
+        rp.chatText = `${pkt.name}: ${pkt.text}`;
+        rp.chatTimer = 4.5;
+      }
+      this.pushFeed(`${pkt.name}: ${pkt.text}`, 'friendly');
+    } else if (pkt.t === 'shot') {
+      const origin = _vec3.set(pkt.x, pkt.y, pkt.z);
+      const dist = origin.distanceTo(this.playerPos);
+      if (dist < 60) {
+        soundEngine.playSpatialGunshot(pkt.w, this.computeStereoPan(origin), dist);
+      }
+      if (rp) {
+        rp.recoilPulse = 1.0;
+      }
+    } else if (pkt.t === 'melee') {
+      if (rp) {
+        rp.recoilPulse = 1.0;
+        if (rp.pos.distanceTo(this.playerPos) < 16) {
+          soundEngine.playMeleeSwing(pkt.heavy);
+        }
+      }
+    } else if (pkt.t === 'exp') {
+      const center = new THREE.Vector3(pkt.x, pkt.y, pkt.z);
+      this.spawnRemoteExplosionFx(center, pkt.radius, pkt.maxDmg);
+    } else if (pkt.t === 'hit') {
+      if (pkt.targetId === this.network.playerId && this.phys.consciousness !== 'dead') {
+        applyLimbTrauma(
+          this.phys,
+          pkt.limbId,
+          pkt.dmg,
+          pkt.bleed,
+          pkt.frac,
+          pkt.sev,
+          Math.random() < 0.2 ? 1 : 0,
+        );
+        soundEngine.playFleshImpact(pkt.dmg > 20);
+        this.shakeIntensity = Math.min(0.24, this.shakeIntensity + pkt.dmg * 0.003);
+        this.hitstopTimer = Math.max(this.hitstopTimer, 0.035);
+        this.pushFeed(`${pkt.attackerName} влучив у вас!`, 'danger');
+        this.pushSnapshot(true);
+      }
+    } else if (pkt.t === 'bot_hit') {
+      if (this.network.isHost) {
+        const dir = new THREE.Vector3(pkt.dx, pkt.dy, pkt.dz).normalize();
+        this.botManager.damageBotLimb(
+          pkt.botId,
+          pkt.limbId,
+          pkt.dmg,
+          pkt.bleed,
+          pkt.frac,
+          pkt.sev,
+          dir,
+          false,
+        );
+      }
+    } else if (pkt.t === 'bot_speech') {
+      if (!this.network.isHost) {
+        this.botManager.setBotSpeech(pkt.botId, pkt.text, pkt.tone);
+      }
+    } else if (pkt.t === 'gest') {
+      if (rp) {
+        const gDef = GESTURE_DEFS.find((g) => g.id === pkt.g);
+        rp.chatText = gDef ? `${rp.name}: [${gDef.nameUk}]` : `${rp.name}: *жест*`;
+        rp.chatTimer = 3.2;
+      }
+    } else if (pkt.t === 'time') {
+      this.timeOfDay = pkt.tod;
+    }
+  }
+
+  private spawnRemoteExplosionFx(center: THREE.Vector3, radius: number, maxDmg: number) {
+    soundEngine.playExplosion();
+    this.shakeIntensity = Math.min(0.32, this.shakeIntensity + 0.18);
+    for (let i = 0; i < 16; i++) {
+      this.spawnPooledParticle(
+        this.expPool,
+        center.x,
+        center.y,
+        center.z,
+        (Math.random() - 0.5) * 14,
+        3 + Math.random() * 10,
+        (Math.random() - 0.5) * 14,
+        0.45 + Math.random() * 0.3,
+        16,
+      );
+    }
+    if (this.network.friendlyFire) {
+      const pd = this.playerPos.distanceTo(center);
+      if (pd < radius && this.phys.consciousness !== 'dead') {
+        const falloff = 1 - pd / radius;
+        applyLimbTrauma(
+          this.phys,
+          'torso',
+          maxDmg * 0.55 * falloff,
+          2.6 * falloff,
+          0.32 * falloff,
+          0,
+          falloff > 0.35 ? 1 : 0,
+          36 * falloff,
+        );
+      }
+    }
+  }
+
+  private stepRemotePlayers(dt: number) {
+    for (const rp of this.remotePlayers.values()) {
+      if (rp.chatTimer > 0) {
+        rp.chatTimer -= dt;
+        if (rp.chatTimer <= 0) rp.chatText = null;
+      }
+      const isDown =
+        rp.consciousness === 'unconscious' ||
+        rp.consciousness === 'cardiacArrest' ||
+        rp.consciousness === 'dead';
+      if (isDown) {
+        if (rp.ragdoll) {
+          stepArticulatedRagdoll(
+            rp.ragdoll,
+            rp.rig,
+            rp.pos,
+            this.world.colliders,
+            resolveRemoteRagdollCollider,
+            dt,
+          );
+        }
+        continue;
+      }
+
+      rp.pos.x = THREE.MathUtils.damp(rp.pos.x, rp.targetPos.x, 14, dt);
+      rp.pos.y = THREE.MathUtils.damp(rp.pos.y, rp.targetPos.y, 14, dt);
+      rp.pos.z = THREE.MathUtils.damp(rp.pos.z, rp.targetPos.z, 14, dt);
+      rp.yaw = lerpAngleDelta(rp.yaw, rp.targetYaw, Math.min(1, dt * 14));
+      rp.recoilPulse = THREE.MathUtils.damp(rp.recoilPulse, 0, 16, dt);
+      rp.flinchPitch = THREE.MathUtils.damp(rp.flinchPitch, 0, 13, dt);
+      rp.flinchRoll = THREE.MathUtils.damp(rp.flinchRoll, 0, 13, dt);
+
+      rp.rig.root.position.copy(rp.pos);
+      rp.rig.root.rotation.set(0, rp.yaw, 0);
+
+      const moveSpeed = Math.hypot(rp.vel.x, rp.vel.z);
+      const twoHanded =
+        rp.weapon === 'rifle_556' ||
+        rp.weapon === 'shotgun_12ga' ||
+        rp.weapon === 'sniper_762';
+
+      stepProceduralCharacterAnim(rp.rig, rp.animState, {
+        dt,
+        moveSpeed,
+        crouchFactor: rp.crouchFactor,
+        aiming: rp.weapon !== 'hands' || rp.aiming,
+        crawling: false,
+        surrendering: false,
+        healing: false,
+        reloading: rp.reloading,
+        woundedFrac: rp.woundedFrac,
+        legInjured: rp.legBroken,
+        recoilPulse: rp.recoilPulse,
+        flinchPitch: rp.flinchPitch,
+        flinchRoll: rp.flinchRoll,
+        twoHandedWeapon: twoHanded,
+      });
+    }
   }
 
   private spawnGroundMedCrate(pos: THREE.Vector3, med: MedItemId) {
@@ -636,6 +1163,9 @@ export class TraumaSandboxEngine {
   advanceTimeOfDay(hours = 4) {
     if (this.isKnockedOut()) return;
     this.timeOfDay = (this.timeOfDay + hours) % 24;
+    if (this.network.connected && this.network.isHost) {
+      this.network.broadcastReliable({ t: 'time', tod: this.timeOfDay });
+    }
     this.pushSnapshot(true);
   }
 
@@ -1090,6 +1620,9 @@ export class TraumaSandboxEngine {
       _dir,
       this.activeWeapon !== 'hands',
     );
+    if (this.network.connected) {
+      this.network.broadcastReliable({ t: 'gest', g: gesture });
+    }
     this.pushSnapshot(true);
   }
 
@@ -1206,6 +1739,13 @@ export class TraumaSandboxEngine {
   }
 
   private onKeyDown = (e: KeyboardEvent) => {
+    const activeEl = document.activeElement;
+    if (
+      activeEl &&
+      (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA')
+    ) {
+      return;
+    }
     if (this.isKnockedOut()) {
       if (e.code === 'Tab') e.preventDefault();
       if (e.code === 'Escape' && this.phase !== 'paused') {
@@ -1499,31 +2039,75 @@ export class TraumaSandboxEngine {
       this.meleeSwingTimer = 0.24;
       this.playerRecoilPulse = 1.0;
       soundEngine.playMeleeSwing(def.damage > 45);
+      if (this.network.connected) {
+        this.network.broadcastReliable({ t: 'melee', heavy: def.damage > 45 });
+      }
       _dir.set(0, 0, -1).applyEuler(this.camera.rotation);
       _raycaster.set(this.camera.position, _dir);
       _raycaster.far = def.range;
 
       const targets = [
         ...this.botManager.getAllRaycastMeshes(),
+        ...this.remoteHitMeshes,
         ...this.world.propHitMeshes,
       ];
       const hits = _raycaster.intersectObjects(targets, false);
       if (hits.length > 0) {
         const hit = hits[0];
-        if (hit.object.userData.botId) {
-          const { severed } = this.botManager.damageBotLimb(
-            hit.object.userData.botId,
-            hit.object.userData.limbId,
-            def.damage,
-            def.bleedPower,
-            def.fractureChance,
-            def.severChance,
-            _dir,
-            true,
-          );
-          soundEngine.playFleshImpact(severed || def.damage > 45);
-          this.spawnBloodBurst(hit.point, severed ? 20 : 10);
-          this.hitstopTimer = 0.045;
+        if (hit.object.userData.remotePlayerId) {
+          const targetId = hit.object.userData.remotePlayerId as string;
+          const limbId = (hit.object.userData.limbId as LimbId) ?? 'torso';
+          if (this.network.friendlyFire) {
+            soundEngine.playFleshImpact(def.damage > 45);
+            this.spawnBloodBurst(hit.point, 12);
+            this.hitstopTimer = 0.045;
+            this.network.sendReliableToPeer(targetId, {
+              t: 'hit',
+              targetId,
+              attackerName: this.network.playerName,
+              limbId,
+              dmg: def.damage,
+              bleed: def.bleedPower,
+              frac: def.fractureChance,
+              sev: def.severChance,
+              dx: _dir.x,
+              dy: _dir.y,
+              dz: _dir.z,
+            });
+          }
+        } else if (hit.object.userData.botId) {
+          const botId = hit.object.userData.botId as string;
+          const limbId = hit.object.userData.limbId as LimbId;
+          if (this.network.connected && !this.network.isHost && this.network.hostId) {
+            soundEngine.playFleshImpact(def.damage > 45);
+            this.spawnBloodBurst(hit.point, 10);
+            this.network.sendReliableToPeer(this.network.hostId, {
+              t: 'bot_hit',
+              botId,
+              limbId,
+              dmg: def.damage,
+              bleed: def.bleedPower,
+              frac: def.fractureChance,
+              sev: def.severChance,
+              dx: _dir.x,
+              dy: _dir.y,
+              dz: _dir.z,
+            });
+          } else {
+            const { severed } = this.botManager.damageBotLimb(
+              botId,
+              limbId,
+              def.damage,
+              def.bleedPower,
+              def.fractureChance,
+              def.severChance,
+              _dir,
+              true,
+            );
+            soundEngine.playFleshImpact(severed || def.damage > 45);
+            this.spawnBloodBurst(hit.point, severed ? 20 : 10);
+            this.hitstopTimer = 0.045;
+          }
         } else if (hit.object.userData.propId) {
           this.damageProp(hit.object.userData.propId, def.damage, _dir);
         }
@@ -1546,6 +2130,20 @@ export class TraumaSandboxEngine {
     this.flashTimer = 0.055;
     soundEngine.playGunshot(this.activeWeapon);
 
+    _dir.set(0, 0, -1).applyEuler(this.camera.rotation);
+    if (this.network.connected) {
+      this.network.broadcastReliable({
+        t: 'shot',
+        w: this.activeWeapon,
+        x: this.playerPos.x,
+        y: this.playerPos.y + 1.4,
+        z: this.playerPos.z,
+        dx: _dir.x,
+        dy: _dir.y,
+        dz: _dir.z,
+      });
+    }
+
     this.botManager.alertBotsToGunshot(this.playerPos, 42);
 
     const cloudSpread =
@@ -1562,6 +2160,7 @@ export class TraumaSandboxEngine {
 
     const targets = [
       ...this.botManager.getAllRaycastMeshes(),
+      ...this.remoteHitMeshes,
       ...(this.phantoms.some((ph) => ph.active) ? this.phantomHitMeshes : []),
       ...this.world.propHitMeshes,
       ...this.world.raycastWalls,
@@ -1587,21 +2186,68 @@ export class TraumaSandboxEngine {
             this.dismissPhantom(ph, true);
             break;
           }
+        } else if (hit.object.userData.remotePlayerId) {
+          const targetId = hit.object.userData.remotePlayerId as string;
+          const limbId = (hit.object.userData.limbId as LimbId) ?? 'torso';
+          if (this.network.friendlyFire) {
+            soundEngine.playFleshImpact(false);
+            this.spawnBloodBurst(hit.point, 10);
+            const rp = this.remotePlayers.get(targetId);
+            if (rp) {
+              rp.flinchPitch = 0.25;
+            }
+            this.network.sendReliableToPeer(targetId, {
+              t: 'hit',
+              targetId,
+              attackerName: this.network.playerName,
+              limbId,
+              dmg: def.damage * powerRemaining,
+              bleed: def.bleedPower * powerRemaining,
+              frac: def.fractureChance,
+              sev: def.severChance,
+              dx: _dir.x,
+              dy: _dir.y,
+              dz: _dir.z,
+            });
+            powerRemaining *= 0.45;
+            if (powerRemaining < 0.2) break;
+          }
         } else if (hit.object.userData.botId) {
-          const { severed } = this.botManager.damageBotLimb(
-            hit.object.userData.botId,
-            hit.object.userData.limbId,
-            def.damage * powerRemaining,
-            def.bleedPower * powerRemaining,
-            def.fractureChance,
-            def.severChance,
-            _dir,
-            true,
-          );
-          soundEngine.playFleshImpact(severed);
-          this.spawnBloodBurst(hit.point, severed ? 18 : 8);
-          powerRemaining *= 0.45;
-          if (powerRemaining < 0.2) break;
+          const botId = hit.object.userData.botId as string;
+          const limbId = hit.object.userData.limbId as LimbId;
+          if (this.network.connected && !this.network.isHost && this.network.hostId) {
+            soundEngine.playFleshImpact(false);
+            this.spawnBloodBurst(hit.point, 8);
+            this.network.sendReliableToPeer(this.network.hostId, {
+              t: 'bot_hit',
+              botId,
+              limbId,
+              dmg: def.damage * powerRemaining,
+              bleed: def.bleedPower * powerRemaining,
+              frac: def.fractureChance,
+              sev: def.severChance,
+              dx: _dir.x,
+              dy: _dir.y,
+              dz: _dir.z,
+            });
+            powerRemaining *= 0.45;
+            if (powerRemaining < 0.2) break;
+          } else {
+            const { severed } = this.botManager.damageBotLimb(
+              botId,
+              limbId,
+              def.damage * powerRemaining,
+              def.bleedPower * powerRemaining,
+              def.fractureChance,
+              def.severChance,
+              _dir,
+              true,
+            );
+            soundEngine.playFleshImpact(severed);
+            this.spawnBloodBurst(hit.point, severed ? 18 : 8);
+            powerRemaining *= 0.45;
+            if (powerRemaining < 0.2) break;
+          }
         } else if (hit.object.userData.propId) {
           this.damageProp(hit.object.userData.propId, def.damage * powerRemaining, _dir);
           break;
@@ -1698,6 +2344,16 @@ export class TraumaSandboxEngine {
     this.botManager.alertBotsToGunshot(center, 68);
     this.shakeIntensity = Math.min(0.32, this.shakeIntensity + 0.22);
     this.hitstopTimer = 0.06;
+    if (this.network.connected) {
+      this.network.broadcastReliable({
+        t: 'exp',
+        x: center.x,
+        y: center.y,
+        z: center.z,
+        radius,
+        maxDmg,
+      });
+    }
 
     for (let i = 0; i < 16; i++) {
       this.spawnPooledParticle(
@@ -2507,16 +3163,78 @@ export class TraumaSandboxEngine {
     if (playerMovingFast) {
       this.botManager.alertBotsToGunshot(this.playerPos, 7.5);
     }
-    this.botManager.update(
-      dt,
-      this.playerPos,
-      this.cachedAimedBotId,
-      this.activeWeapon !== 'hands',
-      this.isCrouching,
-      playerMovingFast,
-      elapsed,
-      this.activeLoot?.id ?? null,
-    );
+
+    if (this.network.connected) {
+      this.stepRemotePlayers(dt);
+      if (this.network.botsEnabled) {
+        if (this.network.isHost) {
+          this.botManager.update(
+            dt,
+            this.playerPos,
+            this.cachedAimedBotId,
+            this.activeWeapon !== 'hands',
+            this.isCrouching,
+            playerMovingFast,
+            elapsed,
+            this.activeLoot?.id ?? null,
+          );
+          this.netBotTimer += dt;
+          if (this.netBotTimer >= 0.1) {
+            this.netBotTimer = 0;
+            this.network.broadcastFast({
+              t: 'bots',
+              tod: this.timeOfDay,
+              list: this.botManager.serializeBotsForNet(),
+            });
+          }
+        } else {
+          this.botManager.stepRemoteBotsVisualOnly(dt);
+        }
+      }
+
+      this.netFastTimer += dt;
+      if (this.netFastTimer >= 0.05) {
+        this.netFastTimer = 0;
+        const leftB =
+          this.phys.limbs.leftLeg.fractured && !this.phys.limbs.leftLeg.splinted;
+        const rightB =
+          this.phys.limbs.rightLeg.fractured && !this.phys.limbs.rightLeg.splinted;
+        const worldVX = len > 0.05 && controlsActive ? (moveX * cosY + moveZ * sinY) * 5.2 : 0;
+        const worldVZ = len > 0.05 && controlsActive ? (-moveX * sinY + moveZ * cosY) * 5.2 : 0;
+        this.network.broadcastFast({
+          t: 'p',
+          x: Math.round(this.playerPos.x * 100) / 100,
+          y: Math.round(this.playerPos.y * 100) / 100,
+          z: Math.round(this.playerPos.z * 100) / 100,
+          yaw: Math.round(this.playerYaw * 1000) / 1000,
+          vx: Math.round(worldVX * 100) / 100,
+          vz: Math.round(worldVZ * 100) / 100,
+          w: this.activeWeapon,
+          c: this.isCrouching ? 1 : 0,
+          a: this.isAiming,
+          r: this.isReloading,
+          f: this.flashlightOn,
+          b: Math.round((this.phys.bloodVolumeMl / this.phys.maxBloodMl) * 100),
+          con: this.phys.consciousness,
+          lB: leftB || rightB,
+          wF: Math.min(
+            1,
+            Math.max(0, 1 - this.phys.bloodVolumeMl / 5000) + this.phys.pain / 120,
+          ),
+        });
+      }
+    } else {
+      this.botManager.update(
+        dt,
+        this.playerPos,
+        this.cachedAimedBotId,
+        this.activeWeapon !== 'hands',
+        this.isCrouching,
+        playerMovingFast,
+        elapsed,
+        this.activeLoot?.id ?? null,
+      );
+    }
 
     if (elapsed - this.lastSnapshotTime >= 0.115) {
       this.lastSnapshotTime = elapsed;
@@ -2816,9 +3534,48 @@ export class TraumaSandboxEngine {
       }
     }
 
-    if (bubbles.length > 5) {
+    for (const rp of this.remotePlayers.values()) {
+      const dist = rp.pos.distanceTo(this.playerPos);
+      if (dist > 44) continue;
+      const headY =
+        rp.consciousness === 'unconscious' ||
+        rp.consciousness === 'cardiacArrest' ||
+        rp.consciousness === 'dead'
+          ? 0.65
+          : rp.crouchFactor > 0.5
+            ? 1.52
+            : 2.05;
+      _proj.set(rp.pos.x, rp.pos.y + headY, rp.pos.z).project(this.camera);
+      if (_proj.z >= 1 || Math.abs(_proj.x) > 1.02 || Math.abs(_proj.y) > 1.02) continue;
+      if (!this.botManager.hasLineOfSight(this.playerPos, rp.pos, 1.55, 1.55)) continue;
+
+      const isHostBadge = rp.id === this.network.hostId ? '👑 ' : '';
+      let label = `${isHostBadge}${rp.name}`;
+      let tone: OverheadSpeechBubble['tone'] = 'friendly';
+      if (rp.consciousness === 'dead') {
+        label = `💀 ${rp.name} (Загинув)`;
+        tone = 'danger';
+      } else if (rp.consciousness === 'unconscious' || rp.consciousness === 'cardiacArrest') {
+        label = `⚠ ${rp.name} (Без свідомості)`;
+        tone = 'warn';
+      } else if (rp.chatText && rp.chatTimer > 0) {
+        label = rp.chatText;
+        tone = 'friendly';
+      }
+
+      bubbles.push({
+        id: `rp_${rp.id}`,
+        text: label,
+        tone,
+        xPct: (_proj.x * 0.5 + 0.5) * 100,
+        yPct: (-_proj.y * 0.5 + 0.5) * 100,
+        dist,
+      });
+    }
+
+    if (bubbles.length > 7) {
       bubbles.sort((a, b) => a.dist - b.dist);
-      bubbles.length = 5;
+      bubbles.length = 7;
     }
     return bubbles;
   }
@@ -2884,11 +3641,32 @@ export class TraumaSandboxEngine {
       speechBubbles: this.buildOverheadSpeechBubbles(),
       feed: this.feed,
       playerPos: { x: this.playerPos.x, z: this.playerPos.z, yaw: this.playerYaw },
+      multiplayer: {
+        connected: this.network.connected,
+        connecting: this.network.connecting,
+        roomId: this.network.roomId,
+        roomName: this.network.roomName,
+        playerId: this.network.playerId,
+        playerName: this.network.playerName,
+        hostId: this.network.hostId,
+        isHost: this.network.isHost,
+        friendlyFire: this.network.friendlyFire,
+        botsEnabled: this.network.botsEnabled,
+        peers: this.network.getPeerList().map((p) => {
+          const rp = this.remotePlayers.get(p.id);
+          return rp
+            ? { ...p, bloodPct: rp.bloodPct, consciousness: rp.consciousness }
+            : p;
+        }),
+        chat: this.network.chatMessages,
+        error: this.network.lastError,
+      },
     });
   }
 
   dispose() {
     this.disposed = true;
+    this.network.dispose();
     cancelAnimationFrame(this.frameId);
     clearTimeout(this.frameId);
     window.removeEventListener('keydown', this.onKeyDown);

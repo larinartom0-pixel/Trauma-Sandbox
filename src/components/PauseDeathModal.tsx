@@ -1,15 +1,32 @@
 import React, { useEffect, useState } from 'react';
-import { RotateCcw, Sliders, Volume2, VolumeX, Play, Maximize2, Minimize2, ExternalLink } from 'lucide-react';
+import {
+  RotateCcw,
+  Sliders,
+  Volume2,
+  VolumeX,
+  Play,
+  Maximize2,
+  Minimize2,
+  ExternalLink,
+  Users,
+  Copy,
+  Check,
+  LogOut,
+  Crown,
+} from 'lucide-react';
 import { getFullscreenElement, toggleFullscreenCompat } from '../game/data';
-import { ControlMode, HudLayoutConfig } from '../game/types';
+import { ControlMode, HudLayoutConfig, MultiplayerSnapshot } from '../game/types';
 
 interface PauseDeathModalProps {
   mode: 'paused' | 'dead';
   causeOfDeath: string | null;
   bloodMl: number;
   hudConfig: HudLayoutConfig;
+  multiplayer: MultiplayerSnapshot;
   onResume: () => void;
   onRestart: () => void;
+  onRespawnMultiplayer: () => void;
+  onLeaveMultiplayer: () => void;
   onOpenHudEditor: () => void;
   onUpdateConfig: (next: HudLayoutConfig) => void;
 }
@@ -19,8 +36,11 @@ export const PauseDeathModal: React.FC<PauseDeathModalProps> = ({
   causeOfDeath,
   bloodMl,
   hudConfig,
+  multiplayer,
   onResume,
   onRestart,
+  onRespawnMultiplayer,
+  onLeaveMultiplayer,
   onOpenHudEditor,
   onUpdateConfig,
 }) => {
@@ -28,6 +48,7 @@ export const PauseDeathModal: React.FC<PauseDeathModalProps> = ({
     Boolean(getFullscreenElement()),
   );
   const [fsBlockedMsg, setFsBlockedMsg] = useState(false);
+  const [copiedId, setCopiedId] = useState(false);
 
   useEffect(() => {
     const onFs = () => {
@@ -194,6 +215,55 @@ export const PauseDeathModal: React.FC<PauseDeathModalProps> = ({
           </div>
         )}
 
+        {multiplayer.connected && (
+          <div className="rounded-md bg-[#121823] border border-sky-500/30 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 text-xs font-bold text-sky-300">
+                <Users className="w-3.5 h-3.5" />
+                <span className="truncate">{multiplayer.roomName}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (multiplayer.roomId) {
+                    void navigator.clipboard?.writeText(multiplayer.roomId);
+                    setCopiedId(true);
+                    setTimeout(() => setCopiedId(false), 1800);
+                  }
+                }}
+                className="px-2 py-1 rounded bg-[#090d14] border border-white/10 text-[10px] font-mono-num text-slate-300 hover:text-white flex items-center gap-1 cursor-pointer"
+              >
+                {copiedId ? (
+                  <>
+                    <Check className="w-3 h-3 text-emerald-400" />
+                    <span>Скопійовано</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3 h-3" />
+                    <span>ID: {multiplayer.roomId}</span>
+                  </>
+                )}
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-1.5 text-[11px]">
+              <span className="px-2 py-0.5 rounded bg-emerald-950/80 border border-emerald-500/30 text-emerald-200 inline-flex items-center gap-1">
+                {multiplayer.isHost && <Crown className="w-3 h-3 text-amber-300" />}
+                {multiplayer.playerName} (Ви)
+              </span>
+              {multiplayer.peers.map((p) => (
+                <span
+                  key={p.id}
+                  className="px-2 py-0.5 rounded bg-[#0a0f18] border border-white/10 text-slate-200 inline-flex items-center gap-1"
+                >
+                  {p.isHost && <Crown className="w-3 h-3 text-amber-300" />}
+                  {p.name}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div className="flex flex-col gap-2 pt-2">
           {mode === 'paused' && (
             <button
@@ -205,14 +275,46 @@ export const PauseDeathModal: React.FC<PauseDeathModalProps> = ({
               <span>Продовжити / Resume</span>
             </button>
           )}
-          <button
-            type="button"
-            onClick={onRestart}
-            className="min-h-[46px] w-full rounded bg-white/10 hover:bg-white/20 text-white font-semibold text-sm flex items-center justify-center gap-2 cursor-pointer"
-          >
-            <RotateCcw className="w-4 h-4" />
-            <span>Перезапустити світ / Restart Town</span>
-          </button>
+          {mode === 'dead' && multiplayer.connected && (
+            <button
+              type="button"
+              onClick={onRespawnMultiplayer}
+              className="min-h-[48px] w-full rounded bg-emerald-600 hover:bg-emerald-500 text-white font-display font-bold text-sm flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <RotateCcw className="w-4 h-4" />
+              <span>Відродитись у кімнаті</span>
+            </button>
+          )}
+          {(!multiplayer.connected || multiplayer.isHost) && mode !== 'dead' && (
+            <button
+              type="button"
+              onClick={onRestart}
+              className="min-h-[46px] w-full rounded bg-white/10 hover:bg-white/20 text-white font-semibold text-sm flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <RotateCcw className="w-4 h-4" />
+              <span>Перезапустити світ / Restart Town</span>
+            </button>
+          )}
+          {!multiplayer.connected && mode === 'dead' && (
+            <button
+              type="button"
+              onClick={onRestart}
+              className="min-h-[46px] w-full rounded bg-white/10 hover:bg-white/20 text-white font-semibold text-sm flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <RotateCcw className="w-4 h-4" />
+              <span>Перезапустити світ / Restart Town</span>
+            </button>
+          )}
+          {multiplayer.connected && (
+            <button
+              type="button"
+              onClick={onLeaveMultiplayer}
+              className="min-h-[44px] w-full rounded bg-red-950/70 hover:bg-red-900/80 border border-red-500/35 text-red-200 font-semibold text-sm flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <LogOut className="w-4 h-4" />
+              <span>Вийти з кімнати (P2P)</span>
+            </button>
+          )}
         </div>
       </div>
     </div>

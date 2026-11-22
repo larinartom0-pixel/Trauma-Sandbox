@@ -14,6 +14,7 @@ import { WEAPON_DEFS } from './data';
 import { buildGridFromLoot, syncLootFromGrid } from './inventory';
 import { createGoreDollModel, createWeaponMesh, GoreDollRig } from './models';
 import { NavMeshGrid } from './navmesh';
+import type { RemoteBotWireState } from './network';
 import {
   applyBandageStroke,
   applyLimbTrauma,
@@ -1883,6 +1884,167 @@ export class BotManager {
         twoHandedWeapon: twoHanded,
         infected: bot.archetype === 'infected',
       });
+    }
+  }
+
+  clearAllBots() {
+    for (const bot of this.bots) {
+      this.scene.remove(bot.rig.root);
+    }
+    this.bots = [];
+    this.meshesDirty = true;
+  }
+
+  respawnTownBotsIfEmpty() {
+    if (this.bots.length === 0) {
+      this.spawnInitialTownBots();
+    }
+  }
+
+  setBotSpeech(
+    botId: string,
+    text: string,
+    tone: 'neutral' | 'warn' | 'danger' | 'friendly',
+  ) {
+    const bot = this.bots.find((b) => b.id === botId);
+    if (bot) {
+      this.speak(bot, text, tone, 3.4);
+    }
+  }
+
+  serializeBotsForNet(): RemoteBotWireState[] {
+    return this.bots.map((b) => ({
+      id: b.id,
+      nUk: b.nameUk,
+      arch: b.archetype,
+      x: Math.round(b.pos.x * 100) / 100,
+      y: Math.round(b.pos.y * 100) / 100,
+      z: Math.round(b.pos.z * 100) / 100,
+      yaw: Math.round(b.yaw * 1000) / 1000,
+      w: b.weapon,
+      c: Math.round(b.crouchFactor * 100) / 100,
+      st: b.aiState,
+      lL: b.phys.limbs.leftLeg.fractured || b.phys.limbs.leftLeg.severed,
+      rL: b.phys.limbs.rightLeg.fractured || b.phys.limbs.rightLeg.severed,
+      bMl: Math.round(b.phys.bloodVolumeMl),
+    }));
+  }
+
+  stepRemoteBotsVisualOnly(dt: number) {
+    for (const bot of this.bots) {
+      if (bot.speechTimer > 0) {
+        bot.speechTimer -= dt;
+        if (bot.speechTimer <= 0) bot.speechText = null;
+      }
+      if (bot.aiState === 'dead' || bot.aiState === 'unconscious') {
+        if (bot.ragdoll && !bot.grabbedByCrusher) {
+          this.stepRagdoll(bot, dt);
+        }
+        continue;
+      }
+      bot.recoilPulse = THREE.MathUtils.damp(bot.recoilPulse, 0, 16, dt);
+      bot.flinchPitch = THREE.MathUtils.damp(bot.flinchPitch, 0, 13, dt);
+      bot.flinchRoll = THREE.MathUtils.damp(bot.flinchRoll, 0, 13, dt);
+      bot.pos.x = THREE.MathUtils.damp(bot.pos.x, bot.patrolTarget.x, 12, dt);
+      bot.pos.y = THREE.MathUtils.damp(bot.pos.y, bot.patrolTarget.y, 12, dt);
+      bot.pos.z = THREE.MathUtils.damp(bot.pos.z, bot.patrolTarget.z, 12, dt);
+      bot.yaw = lerpAngleStep(bot.yaw, bot.targetYaw, dt * 12);
+      bot.rig.root.position.copy(bot.pos);
+      bot.rig.root.rotation.set(0, bot.yaw, 0);
+
+      const moveSpd = bot.pos.distanceTo(bot.patrolTarget) * 6;
+      const twoHanded =
+        bot.weapon === 'rifle_556' ||
+        bot.weapon === 'shotgun_12ga' ||
+        bot.weapon === 'sniper_762';
+      stepProceduralCharacterAnim(bot.rig, bot.animState, {
+        dt,
+        moveSpeed: Math.min(5.5, moveSpd),
+        crouchFactor: bot.crouchFactor,
+        aiming:
+          bot.aiState === 'engage' ||
+          bot.aiState === 'warn' ||
+          bot.aiState === 'takeCover',
+        crawling: bot.aiState === 'crawl',
+        surrendering: bot.aiState === 'surrender',
+        healing: bot.aiState === 'heal',
+        reloading: bot.aiState === 'reload',
+        woundedFrac: Math.max(0, 1 - bot.phys.bloodVolumeMl / 5000),
+        legInjured:
+          bot.phys.limbs.leftLeg.fractured || bot.phys.limbs.rightLeg.fractured,
+        recoilPulse: bot.recoilPulse,
+        flinchPitch: bot.flinchPitch,
+        flinchRoll: bot.flinchRoll,
+        twoHandedWeapon: twoHanded,
+        infected: bot.archetype === 'infected',
+      });
+    }
+  }
+
+  applyRemoteBotSnapshot(list: RemoteBotWireState[]) {
+    const seen = new Set<string>();
+    for (const rb of list) {
+      seen.add(rb.id);
+      let bot = this.bots.find((b) => b.id === rb.id);
+      if (!bot) {
+        this.spawnBotFromSpec(rb.id, {
+          archetype: rb.arch,
+          disposition: 'cautious',
+          weapon: rb.w,
+          x: rb.x,
+          z: rb.z,
+          nameUk: rb.nUk,
+          nameEn: rb.nUk,
+          meds: { bandage: 1 },
+          ammo: {},
+        });
+        bot = this.bots.find((b) => b.id === rb.id);
+        if (!bot) continue;
+        bot.pos.set(rb.x, rb.y, rb.z);
+        bot.yaw = rb.yaw;
+      }
+
+      bot.patrolTarget.set(rb.x, rb.y, rb.z);
+      bot.targetYaw = rb.yaw;
+      bot.crouchFactor = rb.c;
+      bot.phys.bloodVolumeMl = rb.bMl;
+      bot.phys.limbs.leftLeg.fractured = rb.lL;
+      bot.phys.limbs.rightLeg.fractured = rb.rL;
+
+      if (bot.weapon !== rb.w) {
+        bot.weapon = rb.w;
+        bot.rig.weaponMount.clear();
+        if (rb.w !== 'hands') {
+          const wMesh = createWeaponMesh(rb.w);
+          wMesh.scale.setScalar(0.86);
+          bot.rig.weaponMount.add(wMesh);
+        }
+      }
+
+      const prevState = bot.aiState;
+      if (rb.st === 'dead' && prevState !== 'dead') {
+        this.killBot(bot);
+      } else if (rb.st === 'unconscious' && prevState !== 'unconscious') {
+        this.dropBotUnconscious(bot);
+      } else if (
+        (prevState === 'unconscious' || prevState === 'dead') &&
+        rb.st !== 'unconscious' &&
+        rb.st !== 'dead'
+      ) {
+        bot.aiState = rb.st;
+        bot.phys.consciousness = 'awake';
+        this.resetRigToStanding(bot);
+      } else {
+        bot.aiState = rb.st;
+      }
+    }
+
+    for (let i = this.bots.length - 1; i >= 0; i--) {
+      if (!seen.has(this.bots[i].id)) {
+        this.scene.remove(this.bots[i].rig.root);
+        this.bots.splice(i, 1);
+        this.meshesDirty = true;
+      }
     }
   }
 }

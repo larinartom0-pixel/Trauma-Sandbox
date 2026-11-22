@@ -1,10 +1,12 @@
 import React, { useEffect, useState } from 'react';
-import { Sliders, Volume2, VolumeX, Play, Maximize2, Minimize2, ExternalLink } from 'lucide-react';
+import { Sliders, Volume2, VolumeX, Play, Maximize2, Minimize2, ExternalLink, Users } from 'lucide-react';
 import { getFullscreenElement, toggleFullscreenCompat } from '../game/data';
 import { ControlMode } from '../game/types';
 
 interface TitleScreenProps {
   onStart: () => void;
+  onOpenMultiplayer: () => void;
+  multiplayerOpen: boolean;
   onOpenSettings: () => void;
   controlMode: ControlMode;
   onChangeControlMode: (mode: ControlMode) => void;
@@ -14,6 +16,8 @@ interface TitleScreenProps {
 
 export const TitleScreen: React.FC<TitleScreenProps> = ({
   onStart,
+  onOpenMultiplayer,
+  multiplayerOpen,
   onOpenSettings,
   controlMode,
   onChangeControlMode,
@@ -49,6 +53,9 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (multiplayerOpen) return;
+      const tag = (document.activeElement as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
       if (e.code === 'Enter' || e.code === 'Space') {
         e.preventDefault();
         onStart();
@@ -56,7 +63,7 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [onStart]);
+  }, [onStart, multiplayerOpen]);
 
   return (
     <div className="fixed inset-0 z-30 flex flex-col justify-between p-6 md:p-12 pointer-events-auto bg-gradient-to-r from-[#090c10]/92 via-[#090c10]/65 to-transparent">
@@ -208,6 +215,15 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
           >
             <Play className="w-5 h-5 fill-current" />
             <span>Почати гру / Start</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={onOpenMultiplayer}
+            className="min-h-[48px] px-5 py-3 rounded-md bg-sky-600 hover:bg-sky-500 active:scale-[0.99] text-white font-display font-bold text-sm tracking-wide flex items-center gap-2 transition-all cursor-pointer shadow-lg shadow-sky-950/40"
+          >
+            <Users className="w-4 h-4" />
+            <span>Мультиплеєр P2P</span>
           </button>
 
           <button
