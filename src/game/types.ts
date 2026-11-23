@@ -298,61 +298,6 @@ export interface OverheadSpeechBubble {
   dist: number;
 }
 
-export interface P2PRoomMeta {
-  botsEnabled: boolean;
-  friendlyFire: boolean;
-  timeOfDay?: number;
-}
-
-export interface P2PRoomInfo {
-  id: string;
-  gameId: string;
-  name: string;
-  hostId: string;
-  hostName: string;
-  version: string;
-  playerCount: number;
-  maxPlayers: number;
-  createdAt?: number;
-  friendlyFire?: boolean;
-  meta?: Partial<P2PRoomMeta>;
-}
-
-export interface P2PPeerInfo {
-  id: string;
-  name: string;
-  connected: boolean;
-  isHost: boolean;
-  archetype?: BotArchetype;
-  bloodPct?: number;
-  consciousness?: ConsciousnessState;
-}
-
-export interface P2PChatMessage {
-  id: number;
-  senderId: string;
-  senderName: string;
-  text: string;
-  timestamp: number;
-  system?: boolean;
-}
-
-export interface MultiplayerSnapshot {
-  connected: boolean;
-  connecting: boolean;
-  roomId: string | null;
-  roomName: string | null;
-  playerId: string;
-  playerName: string;
-  hostId: string | null;
-  isHost: boolean;
-  friendlyFire: boolean;
-  botsEnabled: boolean;
-  peers: P2PPeerInfo[];
-  chat: P2PChatMessage[];
-  error: string | null;
-}
-
 export interface GameSnapshot {
   phase: GamePhase;
   physiology: PhysiologyState;
@@ -372,6 +317,4 @@ export interface GameSnapshot {
   speechBubbles: OverheadSpeechBubble[];
   feed: FeedMessage[];
   playerPos: { x: number; z: number; yaw: number };
-  multiplayer: MultiplayerSnapshot;
 }
-

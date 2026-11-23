@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { GameHud } from './components/GameHud';
 import { LootModal } from './components/LootModal';
 import { MedicalModal } from './components/MedicalModal';
-import { MultiplayerModal } from './components/MultiplayerModal';
 import { PauseDeathModal } from './components/PauseDeathModal';
 import { TitleScreen } from './components/TitleScreen';
 import { detectTouchMode, loadHudLayout, saveHudLayout } from './game/data';
@@ -18,7 +17,6 @@ export default function App() {
   );
   const [snapshot, setSnapshot] = useState<GameSnapshot | null>(null);
   const [hudEditMode, setHudEditMode] = useState(false);
-  const [multiplayerOpen, setMultiplayerOpen] = useState(false);
 
   const updateHudConfig = useCallback((next: HudLayoutConfig) => {
     setHudConfig(next);
@@ -71,8 +69,6 @@ export default function App() {
       {phase === 'title' && (
         <TitleScreen
           onStart={handleStartFromTitle}
-          onOpenMultiplayer={() => setMultiplayerOpen(true)}
-          multiplayerOpen={multiplayerOpen}
           onOpenSettings={handleOpenHudEditorFromTitle}
           controlMode={hudConfig.controlMode}
           onChangeControlMode={(mode) =>
@@ -81,31 +77,6 @@ export default function App() {
           muted={hudConfig.muted}
           onToggleMute={() =>
             updateHudConfig({ ...hudConfig, muted: !hudConfig.muted })
-          }
-        />
-      )}
-
-      {/* P2P WebRTC Multiplayer Lobby Modal */}
-      {multiplayerOpen && (
-        <MultiplayerModal
-          initialPlayerName={
-            engineRef.current?.getSavedPlayerName() ?? 'Сталкер'
-          }
-          onClose={() => setMultiplayerOpen(false)}
-          onCheckStatus={() =>
-            engineRef.current?.checkP2PServerStatus() ??
-            Promise.resolve({ online: false, roomsCount: 0, latencyMs: 0 })
-          }
-          onFetchRooms={() =>
-            engineRef.current?.fetchP2PRooms() ?? Promise.resolve([])
-          }
-          onCreateRoom={(opts) =>
-            engineRef.current?.createP2PRoom(opts) ??
-            Promise.resolve({ ok: false, error: 'Рушій не ініціалізовано' })
-          }
-          onJoinRoom={(opts) =>
-            engineRef.current?.joinP2PRoom(opts) ??
-            Promise.resolve({ ok: false, error: 'Рушій не ініціалізовано' })
           }
         />
       )}
@@ -143,7 +114,6 @@ export default function App() {
           onToggleFlashlight={() => engineRef.current?.toggleFlashlight()}
           onAdvanceTime={() => engineRef.current?.advanceTimeOfDay(4)}
           onPerformCpr={() => engineRef.current?.performCprAction()}
-          onSendChat={(text) => engineRef.current?.sendP2PChat(text)}
         />
       )}
 
@@ -231,11 +201,8 @@ export default function App() {
           causeOfDeath={snapshot.physiology.causeOfDeath}
           bloodMl={snapshot.physiology.bloodVolumeMl}
           hudConfig={hudConfig}
-          multiplayer={snapshot.multiplayer}
           onResume={() => engineRef.current?.resumeGame()}
           onRestart={() => engineRef.current?.restartWorld()}
-          onRespawnMultiplayer={() => engineRef.current?.respawnInMultiplayer()}
-          onLeaveMultiplayer={() => void engineRef.current?.leaveP2PRoom()}
           onOpenHudEditor={() => {
             engineRef.current?.resumeGame(false);
             setHudEditMode(true);
